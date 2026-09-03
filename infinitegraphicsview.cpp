@@ -27,6 +27,9 @@
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <functional>
+#include <QClipboard>
+#include <QMimeData>
+#include <QApplication>
 
 namespace {
 constexpr int kEndpointPixelTolerance = 12;
@@ -398,6 +401,41 @@ void showComponentParamsDialog(
     dialog.exec();
 }
 
+constexpr char kClipboardMime[] = "application/x-ecsimulator-wire-group";
+
+QByteArray serializeClipboard(const QList<InfiniteGraphicsView::CopiedWireData> &items)
+{
+    QByteArray bytes;
+    QDataStream out(&bytes, QIODevice::WriteOnly);
+    out.setVersion(QDataStream::Qt_6_0);
+    out << qint32(items.size());
+    for (const auto &d : items) {
+        out << d.relativeStart << d.relativeEnd
+            << d.startConnected << d.endConnected
+            << d.isComponent << qint32(d.componentType)
+            << d.params;
+    }
+    return bytes;
+}
+
+QList<InfiniteGraphicsView::CopiedWireData> deserializeClipboard(const QByteArray &bytes)
+{
+    QList<InfiniteGraphicsView::CopiedWireData> items;
+    QDataStream in(bytes);
+    in.setVersion(QDataStream::Qt_6_0);
+    qint32 count = 0;
+    in >> count;
+    for (int i = 0; i < count; ++i) {
+        InfiniteGraphicsView::CopiedWireData d;
+        qint32 typeInt = 0;
+        in >> d.relativeStart >> d.relativeEnd
+            >> d.startConnected >> d.endConnected
+            >> d.isComponent >> typeInt >> d.params;
+        d.componentType = static_cast<ComponentType>(typeInt);
+        items.append(d);
+    }
+    return items;
+}
 } // anonymous namespace
 
 InfiniteGraphicsView::InfiniteGraphicsView(QWidget *parent)
@@ -424,12 +462,36 @@ InfiniteGraphicsView::InfiniteGraphicsView(QWidget *parent)
     setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     setFocusPolicy(Qt::StrongFocus);
+
+    m_wireShortcut = new QShortcut(QKeySequence(Qt::Key_W), this);
+    m_wireShortcut->setContext(Qt::WidgetWithChildrenShortcut);
+    connect(m_wireShortcut, &QShortcut::activated, this, [this]() {
+        setWireMode(!isWireMode());
+    });
+
+    m_resistorShortcut = new QShortcut(QKeySequence(Qt::Key_R), this);
+    m_resistorShortcut->setContext(Qt::WidgetWithChildrenShortcut);
+    connect(m_resistorShortcut, &QShortcut::activated, this, [this]() {
+        if (isComponentMode() && currentComponentType() == ComponentType::Resistor)
+            disableComponentMode();
+        else
+            setComponentMode(ComponentType::Resistor);
+    });
+
+    m_capacitorShortcut = new QShortcut(QKeySequence(Qt::Key_C), this);
+    m_capacitorShortcut->setContext(Qt::WidgetWithChildrenShortcut);
+    connect(m_capacitorShortcut, &QShortcut::activated, this, [this]() {
+        if (isComponentMode() && currentComponentType() == ComponentType::Non_Polar_Capacitor)
+            disableComponentMode();
+        else
+            setComponentMode(ComponentType::Non_Polar_Capacitor);
+    });
+
     setTransformationAnchor(QGraphicsView::AnchorViewCenter);
     setResizeAnchor(QGraphicsView::AnchorViewCenter);
     setViewportUpdateMode(QGraphicsView::SmartViewportUpdate);
     setRenderHint(QPainter::Antialiasing, false);
     setRenderHint(QPainter::SmoothPixmapTransform, false);
-    setMouseTracking(true);
     qDebug() << "InfiniteGraphicsView created (Optimized & Center Zoom)";
 }
 
@@ -618,6 +680,28 @@ private:
     QString m_key;
     QVariant m_old, m_new;
 };
+
+struct ParamChange { QString key; double newValue; };
+
+class ChangeParamCommand;
+
+void pushParamChanges(QUndoStack *stack, Component *comp,
+                      const QString &macroTitle,
+                      const QVector<ParamChange> &changes)
+{
+    bool any = false;
+    for (const auto &c : changes)
+        if (qAbs(c.newValue - comp->param(c.key).toDouble()) > 1e-9) any = true;
+    if (!any) return;
+
+    stack->beginMacro(macroTitle);
+    for (const auto &c : changes) {
+        const double oldVal = comp->param(c.key).toDouble();
+        stack->push(new ChangeParamCommand(comp, c.key, oldVal, c.newValue));
+        comp->setParam(c.key, c.newValue);
+    }
+    stack->endMacro();
+}
 
 class MoveMultipleEndpointsCommand : public QUndoCommand {
 public:
@@ -1221,33 +1305,6 @@ Wire* InfiniteGraphicsView::findWireEndpointNear(const QPoint &scenePos, bool *i
     return best;
 }
 
-Wire* InfiniteGraphicsView::findWireAt(const QPoint &scenePos, qreal maxDist) {
-    if (!scene()) return nullptr;
-    const QList<QGraphicsItem*> items = scene()->items();
-    Wire* best = nullptr;
-    qreal bestDist = maxDist;
-    for (QGraphicsItem* item : items) {
-        Wire* w = dynamic_cast<Wire*>(item);
-        if (!w) continue;
-        QLineF line(w->startScenePos(), w->endScenePos());
-        QPointF p1 = line.p1();
-        QPointF p2 = line.p2();
-        QPointF v = p2 - p1;
-        qreal vDotV = QPointF::dotProduct(v, v);
-        if (vDotV < 0.0001) continue;
-        QPointF wVec = scenePos - p1;
-        qreal t = QPointF::dotProduct(wVec, v) / vDotV;
-        t = qBound(0.0, t, 1.0);
-        QPointF proj = p1 + t * v;
-        qreal dist = QLineF(scenePos, proj).length();
-        if (dist < bestDist) {
-            bestDist = dist;
-            best = w;
-        }
-    }
-    return best;
-}
-
 void InfiniteGraphicsView::keyPressEvent(QKeyEvent *event) {
     // ==============================================================
     // 1. ОТМЕНА ДЕЙСТВИЯ (Ctrl+Z)
@@ -1351,53 +1408,12 @@ void InfiniteGraphicsView::keyPressEvent(QKeyEvent *event) {
     }
 
     // ==============================================================
-    // 9. БЫСТРОЕ ПЕРЕКЛЮЧЕНИЕ РЕЖИМА ПРОВОДА (Клавиша W)
-    // ==============================================================
-    if ((event->key() == Qt::Key_W || event->nativeScanCode() == 17) && event->modifiers() == Qt::NoModifier) {
-        setWireMode(!isWireMode()); // Включить/выключить режим Wire
-        event->accept();
-        qDebug() << "Wire - w";
-        qDebug() << "ScanCode:" << event->nativeScanCode() << "Key:" << event->key() << "Text:" << event->text();
-        return;
-    }
-
-    // ==============================================================
-    // 10. БЫСТРОЕ ПЕРЕКЛЮЧЕНИЕ РЕЖИМА Резистора (Клавиша R)
-    // ==============================================================
-    if ((event->key() == Qt::Key_R || event->nativeScanCode() == 19) && event->modifiers() == Qt::NoModifier) {
-        // Если резистор уже активен — выключаем его.
-        // В противном случае включаем режим резистора (автоматически выключит провод).
-        if (isComponentMode() && currentComponentType() == ComponentType::Resistor) {
-            disableComponentMode();
-        } else {
-            setComponentMode(ComponentType::Resistor);
-        }
-        event->accept();
-        qDebug() << "Resistor - r";
-        qDebug() << "ScanCode:" << event->nativeScanCode() << "Key:" << event->key() << "Text:" << event->text();
-        return;
-    }
-
-    // ==============================================================
-    // 11. БЫСТРОЕ ПЕРЕКЛЮЧЕНИЕ РЕЖИМА Неполярного конденсатора (C)
-    // ==============================================================
-    if ((event->key() == Qt::Key_C || event->nativeScanCode() == 46) && event->modifiers() == Qt::NoModifier) {
-        if (isComponentMode() && currentComponentType() == ComponentType::Non_Polar_Capacitor) {
-            disableComponentMode();
-        } else {
-            setComponentMode(ComponentType::Non_Polar_Capacitor);
-        }
-        event->accept();
-        return;
-    }
-
-    // ==============================================================
     // 00. ПЕРЕМЕЩЕНИЕ СТРЕЛКАМИ ИЛИ ПАНОРАМИРОВАНИЕ (← ↑ → ↓)
     // ==============================================================
     if (event->key() == Qt::Key_Left || event->key() == Qt::Key_Right ||
         event->key() == Qt::Key_Up || event->key() == Qt::Key_Down)
     {
-        QPoint delta = Counter_Steps(event); // Вычисляем шаг (базовый 50, с Shift - 200)
+        QPoint delta = countSteps(event); // Вычисляем шаг (базовый 50, с Shift - 200)
         QList<QGraphicsItem*> selected = scene() ? scene()->selectedItems() : QList<QGraphicsItem*>();
 
         // Если ничего не выделено, двигаем объект, на который наведен курсор (m_hoveredWire)
@@ -1441,7 +1457,7 @@ void InfiniteGraphicsView::keyPressEvent(QKeyEvent *event) {
     }
 }
 
-QPoint InfiniteGraphicsView::Counter_Steps(QKeyEvent *event) {
+QPoint InfiniteGraphicsView::countSteps(QKeyEvent *event) {
     qreal step = 50.0;
     if (event->modifiers() & Qt::ShiftModifier)
         step *= 4.0;
@@ -1639,6 +1655,9 @@ void InfiniteGraphicsView::copySelected() {
         }
         m_clipboard.append(data);
     }
+    auto *mime = new QMimeData;
+    mime->setData(kClipboardMime, serializeClipboard(m_clipboard));
+    QApplication::clipboard()->setMimeData(mime);
 }
 
 void InfiniteGraphicsView::cutSelected() {
@@ -1652,6 +1671,10 @@ void InfiniteGraphicsView::cutSelected() {
 }
 
 void InfiniteGraphicsView::pasteClipboard() {
+    if (const QMimeData *mime = QApplication::clipboard()->mimeData();
+        mime && mime->hasFormat(kClipboardMime)) {
+        m_clipboard = deserializeClipboard(mime->data(kClipboardMime));
+    }
     if (!scene() || m_clipboard.isEmpty()) return;
     int minX = std::numeric_limits<int>::max();
     int maxX = std::numeric_limits<int>::lowest();

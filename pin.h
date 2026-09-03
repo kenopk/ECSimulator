@@ -6,14 +6,18 @@
 
 class Component; // предварительное объявление — Component нам пока не нужен целиком
 
-class Pin
+// Pin — простая структура данных (все поля публичные, инвариантов нет),
+// поэтому объявлена как struct, а не class — как и другие такие же
+// value-типы в проекте (ResistorGeometry, CopiedWireData).
+struct Pin
 {
-public:
-    Pin();
-
     Component *owner = nullptr;   // nullptr = "плавающий" контакт без компонента
-    QPoint localOffset;          // используется, если owner != nullptr
-    QPoint standalonePos;        // используется, если owner == nullptr
+    QPoint localOffset;           // TODO(pin-ownership): пока НЕ используется —
+    // scenePos() не учитывает owner/localOffset,
+    // реализована только ветка "плавающего" пина
+    // (см. standalonePos ниже). Прежде чем
+    // присваивать owner, доделайте scenePos().
+    QPoint standalonePos;         // используется всегда, пока owner не реализован
 
     QPointF scenePos() const;
 };

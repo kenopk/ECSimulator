@@ -31,10 +31,13 @@ public:
     // Ctrl+c ctrl+v
     QVariantMap params() const { return m_params; }
     void setParams(const QVariantMap &p) { m_params = p; update(); }
+    void updateGeometry() override;
 
 private:
     ComponentType m_type;
     QVariantMap m_params;   // храним все параметры компонента
+    mutable QPainterPath m_cachedShape;
+    mutable bool m_shapeDirty = true;
 };
 
 #endif // COMPONENT_H

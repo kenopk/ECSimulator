@@ -283,7 +283,7 @@ private:
 
 MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     // Конструктор главного окна.
-    qApp->setStyleSheet(buildAppStyleSheet(QColor(30, 30, 46)));
+    this->setStyleSheet(buildAppStyleSheet(QColor(30, 30, 46)));
     // Здесь мы сразу вызываем две основные функции настройки.
     setupUI();      // 1. Создаём все видимые элементы (кнопки, текст)
     setupStyles();  // 2. Применяем красивые стили (цвета, градиенты)

@@ -5,7 +5,8 @@
 #include <QPainterPathStroker>
 
 namespace {
-constexpr qreal kDotRadius = 3.0;
+constexpr qreal kDotRadius = 3.0;      // запас в boundingRect() под точку конца + сглаживание
+constexpr qreal kEndpointVisualRadius = 2.0;  // реальный радиус отрисовки точки конца
 constexpr qreal kHitWidth = 3;
 }
 
@@ -22,6 +23,7 @@ Wire::Wire(Pin startPin, Pin endPin, QGraphicsItem *parent)
 void Wire::updateGeometry() {
     prepareGeometryChange();
     setLine(QLineF(m_startPin.scenePos(), m_endPin.scenePos()));
+    m_wireShapeDirty = true;   // геометрия поменялась — старый shape() больше не верен
 }
 
 void Wire::setStartConnected(bool connected) {
@@ -73,28 +75,25 @@ void Wire::paint(QPainter *painter, const QStyleOptionGraphicsItem *option, QWid
 
     painter->setPen(Qt::NoPen);
 
-    if (!m_startConnected) {
-        if (m_startNearOther) {
-            painter->setBrush(Qt::red);
-            painter->drawEllipse(line().p1(), 2.0, 2.0);
-        } else {
-            painter->setBrush(Qt::white);
-            painter->drawEllipse(line().p1(), 2.0, 2.0);
+    // Общий хелпер вместо дублированных if/else для start- и end-точки:
+    // рисует опциональное кольцо подсветки (если именно этот конец наведён
+    // мышью — см. setEndpointHovered()), а поверх — саму точку конца.
+    auto drawEndpoint = [&](const QPointF &p, bool nearOther, bool hovered) {
+        if (hovered) {
+            painter->setBrush(QColor(0, 255, 255, 120));
+            painter->drawEllipse(p, kEndpointVisualRadius + 2.0, kEndpointVisualRadius + 2.0);
         }
-    }
+        painter->setBrush(nearOther ? Qt::red : Qt::white);
+        painter->drawEllipse(p, kEndpointVisualRadius, kEndpointVisualRadius);
+    };
 
-    if (!m_endConnected) {
-        if (m_endNearOther) {
-            painter->setBrush(Qt::red);
-            painter->drawEllipse(line().p2(), 2.0, 2.0);
-        } else {
-            painter->setBrush(Qt::white);
-            painter->drawEllipse(line().p2(), 2.0, 2.0);
-        }
-    }
+    if (!m_startConnected) drawEndpoint(line().p1(), m_startNearOther, m_startHovered);
+    if (!m_endConnected)   drawEndpoint(line().p2(), m_endNearOther, m_endHovered);
 }
 
 QPainterPath Wire::shape() const {
+    if (!m_wireShapeDirty) return m_wireCachedShape;
+
     QPainterPath path;
     path.moveTo(line().p1());
     path.lineTo(line().p2());
@@ -102,7 +101,10 @@ QPainterPath Wire::shape() const {
     QPainterPathStroker stroker;
     stroker.setWidth(kHitWidth);
     stroker.setCapStyle(Qt::RoundCap);
-    return stroker.createStroke(path);
+
+    m_wireCachedShape = stroker.createStroke(path);
+    m_wireShapeDirty = false;
+    return m_wireCachedShape;
 }
 
 void Wire::setHovered(bool hovered) {

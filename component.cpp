@@ -18,9 +18,6 @@ constexpr qreal kBodyLength    = 20.0;  // длина прямоугольник
 constexpr qreal kBodyHeight    = 8.0;   // высота прямоугольника
 constexpr int kLabelFontSize   = 6;     // размер шрифта подписей
 
-// Ширина зоны клика вокруг контактов и корпуса.
-constexpr qreal kComponentHitWidth = 10.0;
-
 // ---- Размеры неполярного конденсатора ----
 constexpr qreal kCapPlateThickness = 2.5;   // ТОЛЩИНА пластины
 constexpr qreal kCapPlateHeight    = 16.0;  // ДЛИНА пластины
@@ -166,10 +163,27 @@ Component::Component(Pin startPin, Pin endPin, ComponentType type, QGraphicsItem
     }
 }
 
+// ---------- Инвалидация кэша при изменении геометрии провода ----------
+// Вызывается базовым Wire (см. Wire::setStartPos/setEndPos/конструктор) каждый
+// раз, когда меняются конечные точки — то есть именно тогда, когда старый
+// m_cachedShape перестаёт соответствовать реальной форме компонента.
+void Component::updateGeometry() {
+    m_shapeDirty = true;
+    Wire::updateGeometry();
+}
+
 QVariant Component::param(const QString &key) const { return m_params.value(key); }
 
 void Component::setParam(const QString &key, const QVariant &value) {
-    if (m_params.value(key) != value) { m_params[key] = value; update(); }
+    if (m_params.value(key) != value) {
+        // Смена номинала может изменить размер подписи (resistorTextRect/
+        // capacitorTextRect), а она входит в boundingRect() — предупреждаем
+        // Qt Graphics View об этом ДО фактического изменения значения.
+        prepareGeometryChange();
+        m_params[key] = value;
+        m_shapeDirty = true;   // подпись — часть shape()/boundingRect(), кэш устарел
+        update();
+    }
 }
 
 double Component::resistance() const { return m_params.value("resistance", 1000.0).toDouble(); }
@@ -208,8 +222,14 @@ void Component::paint(QPainter *painter, const QStyleOptionGraphicsItem *option,
         painter->drawPolygon(makeResistorPolygon(g));
 
         painter->setPen(Qt::NoPen);
-        if (!isStartConnected()) painter->setBrush(isStartNearOther() ? Qt::red : Qt::white), painter->drawEllipse(g.p1, 2.0, 2.0);
-        if (!isEndConnected())   painter->setBrush(isEndNearOther() ? Qt::red : Qt::white),   painter->drawEllipse(g.p2, 2.0, 2.0);
+        if (!isStartConnected()) {
+            painter->setBrush(isStartNearOther() ? Qt::red : Qt::white);
+            painter->drawEllipse(g.p1, 2.0, 2.0);
+        }
+        if (!isEndConnected()) {
+            painter->setBrush(isEndNearOther() ? Qt::red : Qt::white);
+            painter->drawEllipse(g.p2, 2.0, 2.0);
+        }
 
         const QString valueStr = formatResistanceStr(resistance());
         const QRectF upRect = resistorTextRect(g, resistance(), false);
@@ -246,8 +266,14 @@ void Component::paint(QPainter *painter, const QStyleOptionGraphicsItem *option,
         painter->drawLine(rightPlate - n * plateHalf, rightPlate + n * plateHalf);
 
         painter->setPen(Qt::NoPen);
-        if (!isStartConnected()) painter->setBrush(isStartNearOther() ? Qt::red : Qt::white), painter->drawEllipse(g.p1, 2.0, 2.0);
-        if (!isEndConnected())   painter->setBrush(isEndNearOther() ? Qt::red : Qt::white),   painter->drawEllipse(g.p2, 2.0, 2.0);
+        if (!isStartConnected()) {
+            painter->setBrush(isStartNearOther() ? Qt::red : Qt::white);
+            painter->drawEllipse(g.p1, 2.0, 2.0);
+        }
+        if (!isEndConnected()) {
+            painter->setBrush(isEndNearOther() ? Qt::red : Qt::white);
+            painter->drawEllipse(g.p2, 2.0, 2.0);
+        }
 
         const QString valueStr = formatCapacitanceShort(capacitance());
         const QRectF upRect = capacitorTextRect(g, capacitance(), false);
@@ -260,8 +286,14 @@ void Component::paint(QPainter *painter, const QStyleOptionGraphicsItem *option,
     painter->setPen(pen);
     painter->drawLine(axis);
     painter->setPen(Qt::NoPen);
-    if (!isStartConnected()) painter->setBrush(isStartNearOther() ? Qt::red : Qt::white), painter->drawEllipse(axis.p1(), 2.0, 2.0);
-    if (!isEndConnected())   painter->setBrush(isEndNearOther() ? Qt::red : Qt::white),   painter->drawEllipse(axis.p2(), 2.0, 2.0);
+    if (!isStartConnected()) {
+        painter->setBrush(isStartNearOther() ? Qt::red : Qt::white);
+        painter->drawEllipse(axis.p1(), 2.0, 2.0);
+    }
+    if (!isEndConnected()) {
+        painter->setBrush(isEndNearOther() ? Qt::red : Qt::white);
+        painter->drawEllipse(axis.p2(), 2.0, 2.0);
+    }
 }
 
 // <-- ИСПРАВЛЕНИЕ 6: возвращён boundingRect с поддержкой обеих сторон текста
@@ -284,74 +316,86 @@ QRectF Component::boundingRect() const
 
 QPainterPath Component::shape() const
 {
+    if (!m_shapeDirty) return m_cachedShape;
+
+    QPainterPath result;
+
     if (m_type == ComponentType::Non_Polar_Capacitor) {
         const ResistorGeometry g = makeResistorGeometry(line());
-        if (!g.valid) return Wire::shape();
+        if (!g.valid) {
+            result = Wire::shape();
+        } else {
+            const QPointF d = g.p2 - g.p1;
+            const qreal len = std::hypot(d.x(), d.y());
+            const QPointF u = (len > 1e-6) ? (d / len) : QPointF(1, 0);
+            const QPointF n(-u.y(), u.x());
+            const QPointF center = (g.p1 + g.p2) / 2.0;
+            const qreal plateHalf = kCapPlateHeight / 2.0;
+            const qreal gapHalf   = kCapGap / 2.0;
+            const QPointF leftPlate  = center - u * gapHalf;
+            const QPointF rightPlate = center + u * gapHalf;
 
-        const QPointF d = g.p2 - g.p1;
-        const qreal len = std::hypot(d.x(), d.y());
-        const QPointF u = (len > 1e-6) ? (d / len) : QPointF(1, 0);
-        const QPointF n(-u.y(), u.x());
-        const QPointF center = (g.p1 + g.p2) / 2.0;
-        const qreal plateHalf = kCapPlateHeight / 2.0;
-        const qreal gapHalf   = kCapGap / 2.0;
-        const QPointF leftPlate  = center - u * gapHalf;
-        const QPointF rightPlate = center + u * gapHalf;
+            QPainterPath path;
+            path.moveTo(g.p1); path.lineTo(leftPlate);
+            path.moveTo(g.p2); path.lineTo(rightPlate);
+            path.moveTo(leftPlate  - n * plateHalf); path.lineTo(leftPlate  + n * plateHalf);
+            path.moveTo(rightPlate - n * plateHalf); path.lineTo(rightPlate + n * plateHalf);
 
-        QPainterPath path;
-        path.moveTo(g.p1); path.lineTo(leftPlate);
-        path.moveTo(g.p2); path.lineTo(rightPlate);
-        path.moveTo(leftPlate  - n * plateHalf); path.lineTo(leftPlate  + n * plateHalf);
-        path.moveTo(rightPlate - n * plateHalf); path.lineTo(rightPlate + n * plateHalf);
+            QPainterPathStroker stroker;
+            stroker.setWidth(2.0);
+            stroker.setCapStyle(Qt::FlatCap);
+            QPainterPath stroke = stroker.createStroke(path);
 
-        QPainterPathStroker stroker;
-        stroker.setWidth(2.0);
-        stroker.setCapStyle(Qt::FlatCap);
-        QPainterPath stroke = stroker.createStroke(path);
+            QPainterPath gap;
+            gap.addPolygon(QPolygonF() << (leftPlate  - n * plateHalf)
+                                       << (leftPlate  + n * plateHalf)
+                                       << (rightPlate + n * plateHalf)
+                                       << (rightPlate - n * plateHalf));
+            gap.closeSubpath();
 
-        QPainterPath gap;
-        gap.addPolygon(QPolygonF() << (leftPlate  - n * plateHalf)
-                                   << (leftPlate  + n * plateHalf)
-                                   << (rightPlate + n * plateHalf)
-                                   << (rightPlate - n * plateHalf));
-        gap.closeSubpath();
+            QPainterPath dots;
+            dots.addEllipse(g.p1, 2.0, 2.0);
+            dots.addEllipse(g.p2, 2.0, 2.0);
 
-        QPainterPath dots;
-        dots.addEllipse(g.p1, 2.0, 2.0);
-        dots.addEllipse(g.p2, 2.0, 2.0);
+            result = stroke.united(gap).united(dots);
+        }
+    } else if (m_type == ComponentType::Resistor) {
+        const ResistorGeometry g = makeResistorGeometry(line());
+        if (!g.valid) {
+            result = Wire::shape();
+        } else {
+            constexpr qreal kPenWidth = 2.0;
 
-        return stroke.united(gap).united(dots);
+            QPainterPath body;
+            body.addPolygon(makeResistorPolygon(g));
+            body.closeSubpath();
+
+            QPainterPathStroker outlineStroker;
+            outlineStroker.setWidth(kPenWidth);
+            outlineStroker.setJoinStyle(Qt::MiterJoin);
+            const QPainterPath outline = outlineStroker.createStroke(body);
+
+            QPainterPath leads;
+            if (g.drawLeads) {
+                leads.moveTo(g.p1); leads.lineTo(g.bodyA);
+                leads.moveTo(g.p2); leads.lineTo(g.bodyB);
+            }
+            QPainterPathStroker leadStroker;
+            leadStroker.setWidth(kPenWidth);
+            leadStroker.setCapStyle(Qt::RoundCap);
+            const QPainterPath leadsStroke = leadStroker.createStroke(leads);
+
+            QPainterPath dots;
+            dots.addEllipse(g.p1, 2.0, 2.0);
+            dots.addEllipse(g.p2, 2.0, 2.0);
+
+            result = body.united(outline).united(leadsStroke).united(dots);
+        }
+    } else {
+        result = Wire::shape();
     }
 
-    if (m_type != ComponentType::Resistor) return Wire::shape();
-
-    const ResistorGeometry g = makeResistorGeometry(line());
-    if (!g.valid) return Wire::shape();
-
-    constexpr qreal kPenWidth = 2.0;
-
-    QPainterPath body;
-    body.addPolygon(makeResistorPolygon(g));
-    body.closeSubpath();
-
-    QPainterPathStroker outlineStroker;
-    outlineStroker.setWidth(kPenWidth);
-    outlineStroker.setJoinStyle(Qt::MiterJoin);
-    const QPainterPath outline = outlineStroker.createStroke(body);
-
-    QPainterPath leads;
-    if (g.drawLeads) {
-        leads.moveTo(g.p1); leads.lineTo(g.bodyA);
-        leads.moveTo(g.p2); leads.lineTo(g.bodyB);
-    }
-    QPainterPathStroker leadStroker;
-    leadStroker.setWidth(kPenWidth);
-    leadStroker.setCapStyle(Qt::RoundCap);
-    const QPainterPath leadsStroke = leadStroker.createStroke(leads);
-
-    QPainterPath dots;
-    dots.addEllipse(g.p1, 2.0, 2.0);
-    dots.addEllipse(g.p2, 2.0, 2.0);
-
-    return body.united(outline).united(leadsStroke).united(dots);
+    m_cachedShape = result;
+    m_shapeDirty = false;
+    return m_cachedShape;
 }

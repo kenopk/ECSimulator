@@ -10,7 +10,7 @@ class Wire : public QGraphicsLineItem {
 public:
     Wire(Pin startPin, Pin endPin, QGraphicsItem *parent = nullptr);
 
-    void updateGeometry();
+    virtual void updateGeometry();
 
     void setStartConnected(bool connected);
     void setEndConnected(bool connected);
@@ -48,6 +48,11 @@ private:
     bool m_endHovered = false;
     bool m_startNearOther = false;
     bool m_endNearOther = false;
+
+    // Кэш shape(): пересобирается только когда геометрия провода реально
+    // меняется (см. updateGeometry()), а не при каждом hit-тесте/hover.
+    mutable QPainterPath m_wireCachedShape;
+    mutable bool m_wireShapeDirty = true;
 };
 
 #endif

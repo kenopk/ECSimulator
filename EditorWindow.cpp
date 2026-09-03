@@ -174,11 +174,10 @@ void EditorWindow::setupUI() {
     connect(resetViewAction, &QAction::triggered, this, &EditorWindow::onResetView);
 
     // ----- Меню "Edit" -----
-    QMenu *editMenu = menuBar->addMenu("Edit");
-    Draw_Edit_Menu(editMenu);
-    connect(editMenu, &QMenu::aboutToShow, this, [this, editMenu]() {
-        editMenu->clear();          // ← безопасно: все addAction/addMenu — дети editMenu
-        Draw_Edit_Menu(editMenu);   // пересобираем с актуальным состоянием
+    m_editMenu = menuBar->addMenu("Edit");
+    buildPersistentEditMenu(m_editMenu);   // строится один раз — см. комментарий в .h
+    connect(m_editMenu, &QMenu::aboutToShow, this, [this]() {
+        updatePersistentEditMenuState();
         updateUndoRedoActions();
     });
 
@@ -280,10 +279,6 @@ void EditorWindow::Draw_Edit_Menu(QMenu *menu) {
     menu->addAction(redoAction);
     menu->addSeparator();
 
-    /*menu->addAction(undoAction);
-    menu->addAction(redoAction);
-    menu->addSeparator();*/
-
     // === НОВОЕ: буфер обмена в меню ===
     QAction *copyAction = menu->addAction("Копировать\tCtrl+C");
     connect(copyAction, &QAction::triggered, this, [this]() {
@@ -318,6 +313,105 @@ void EditorWindow::Draw_Edit_Menu(QMenu *menu) {
         InfiniteGraphicsView *view = getCurrentView();
         if (view) view->deleteSelectedItems();
     });
+}
+
+// =============================================================
+// Постоянное меню "Edit" (menu bar) — в отличие от Draw_Edit_Menu()
+// выше (который создаёт временное меню под правым кликом заново
+// при каждом вызове), эти два метода разделяют "построить один раз"
+// и "обновить состояние" — чтобы не плодить QAction/QMenu объекты
+// при каждом открытии меню в menu bar.
+// =============================================================
+void EditorWindow::buildPersistentEditMenu(QMenu *menu) {
+    m_wireMenuAction = menu->addAction("Wire\tw");
+    m_wireMenuAction->setCheckable(true);
+    connect(m_wireMenuAction, &QAction::triggered, this, [this]() {
+        if (auto *v = getCurrentView()) v->setWireMode(!v->isWireMode());
+    });
+
+    m_resistorMenuAction = menu->addAction("Resistor\tr");
+    m_resistorMenuAction->setCheckable(true);
+    connect(m_resistorMenuAction, &QAction::triggered, this, [this]() {
+        auto *v = getCurrentView();
+        if (!v) return;
+        if (v->isComponentMode() && v->currentComponentType() == ComponentType::Resistor)
+            v->disableComponentMode();
+        else
+            v->setComponentMode(ComponentType::Resistor);
+    });
+
+    m_capMenuAction = menu->addAction("Non-polar capacitor\tc");
+    m_capMenuAction->setCheckable(true);
+    connect(m_capMenuAction, &QAction::triggered, this, [this]() {
+        auto *v = getCurrentView();
+        if (!v) return;
+        if (v->isComponentMode() && v->currentComponentType() == ComponentType::Non_Polar_Capacitor)
+            v->disableComponentMode();
+        else
+            v->setComponentMode(ComponentType::Non_Polar_Capacitor);
+    });
+    menu->addAction("Polar capacitor");
+    menu->addSeparator();
+
+    QMenu *passive = menu->addMenu("Passive elements");
+    passive->addAction("Inductor coil");
+    passive->addAction("Switch");
+
+    QMenu *active = menu->addMenu("Active elements");
+    active->addAction("Diode");
+
+    QMenu *activeBlocks = menu->addMenu("Active blocks");
+    activeBlocks->addAction("Operational amplifier ( - top)");
+
+    menu->addMenu("Logic elements, inputs and outputs");
+    menu->addMenu("Digital elements");
+    menu->addMenu("Analog and hybrid elements");
+
+    menu->addSeparator();
+    menu->addAction(undoAction);
+    menu->addAction(redoAction);
+    menu->addSeparator();
+
+    QAction *copyAction = menu->addAction("Копировать\tCtrl+C");
+    connect(copyAction, &QAction::triggered, this, [this]() {
+        if (auto *v = getCurrentView()) v->copySelected();
+    });
+    QAction *cutAction = menu->addAction("Вырезать\tCtrl+X");
+    connect(cutAction, &QAction::triggered, this, [this]() {
+        if (auto *v = getCurrentView()) v->cutSelected();
+    });
+    QAction *pasteAction = menu->addAction("Вставить\tCtrl+V");
+    connect(pasteAction, &QAction::triggered, this, [this]() {
+        if (auto *v = getCurrentView()) v->pasteClipboard();
+    });
+    menu->addSeparator();
+
+    m_selectMenuAction = menu->addAction("Выделить");
+    m_selectMenuAction->setCheckable(true);
+    connect(m_selectMenuAction, &QAction::triggered, this, [this]() {
+        if (auto *v = getCurrentView()) {
+            v->setWireMode(false);
+            v->disableComponentMode();
+        }
+    });
+
+    m_deleteMenuAction = menu->addAction("Удалить\t Del");
+    connect(m_deleteMenuAction, &QAction::triggered, this, [this]() {
+        if (auto *v = getCurrentView()) v->deleteSelectedItems();
+    });
+
+    updatePersistentEditMenuState();   // сразу выставить корректное начальное состояние
+}
+
+void EditorWindow::updatePersistentEditMenuState() {
+    InfiniteGraphicsView *view = getCurrentView();
+    m_wireMenuAction->setChecked(view && view->isWireMode());
+    m_resistorMenuAction->setChecked(view && view->isComponentMode() &&
+                                     view->currentComponentType() == ComponentType::Resistor);
+    m_capMenuAction->setChecked(view && view->isComponentMode() &&
+                                view->currentComponentType() == ComponentType::Non_Polar_Capacitor);
+    m_selectMenuAction->setChecked(view && !view->isWireMode() && !view->isComponentMode());
+    m_deleteMenuAction->setEnabled(view && view->scene() && !view->scene()->selectedItems().isEmpty());
 }
 
 // =============================================================
@@ -454,9 +548,9 @@ void EditorWindow::createNewTab(const QString &title) {
     layout->setContentsMargins(0, 0, 0, 0);
 
     InfiniteGraphicsView *view = new InfiniteGraphicsView;
-    view->setBackgroundBrush(m_backgroundColor);
     view->setPreferredCursor(m_cursorShape);
     InfiniteGraphicsScene *scene = new InfiniteGraphicsScene(view);
+    scene->setBackgroundColor(m_backgroundColor);   // фон рисует сцена (drawBackground), не вьюха
 
     scene->setSceneRect(-10000, -10000, 20000, 20000);
     qDebug() << "  sceneRect установлена: (-10000, -10000, 20000, 20000)";
@@ -900,14 +994,19 @@ void EditorWindow::createSettingsTab() {
 void EditorWindow::applyTheme(const QColor &bg)
 {
     qApp->setStyleSheet(buildAppStyleSheet(bg));   // всё приложение
+    m_backgroundColor = bg;   // запоминаем — используется при создании следующих вкладок
 
     if (!tabWidget) return;   // ← вкладки ещё не созданы — красить нечего
     for (int i = 0; i < tabWidget->count(); ++i) {
         QWidget *w = tabWidget->widget(i);
         if (!w) continue;
         const QList<InfiniteGraphicsView*> views = w->findChildren<InfiniteGraphicsView*>();
-        for (InfiniteGraphicsView *v : views)
-            v->setBackgroundBrush(bg);
+        for (InfiniteGraphicsView *v : views) {
+            // InfiniteGraphicsScene не имеет Q_OBJECT (не проходит через moc),
+            // поэтому qobject_cast здесь не сработает — нужен dynamic_cast (RTTI).
+            if (auto *s = dynamic_cast<InfiniteGraphicsScene*>(v->scene()))
+                s->setBackgroundColor(bg);
+        }
     }
 }
 

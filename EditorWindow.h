@@ -47,7 +47,9 @@ private:
     // Внутренние методы настройки и логики
     void setupUI();
     void createNewTab(const QString &title);
-    void Draw_Edit_Menu(QMenu *menu);
+    void Draw_Edit_Menu(QMenu *menu);   // используется ТОЛЬКО для временного контекстного меню (ПКМ)
+    void buildPersistentEditMenu(QMenu *menu);   // строит меню "Edit" в menu bar ОДИН раз
+    void updatePersistentEditMenuState();        // обновляет checked/enabled на каждый aboutToShow
     QString generateUniqueTabName(const QString &baseName);
 
     // Вспомогательные функции
@@ -63,6 +65,15 @@ private:
 
     QAction *undoAction = nullptr;
     QAction *redoAction = nullptr;
+
+    // Постоянное меню "Edit" — создаётся один раз в setupUI(), затем только
+    // обновляется через updatePersistentEditMenuState() (см. .cpp).
+    QMenu *m_editMenu = nullptr;
+    QAction *m_wireMenuAction = nullptr;
+    QAction *m_resistorMenuAction = nullptr;
+    QAction *m_capMenuAction = nullptr;
+    QAction *m_selectMenuAction = nullptr;
+    QAction *m_deleteMenuAction = nullptr;
 
     void createSettingsTab();
     QColor m_backgroundColor = QColor(30, 30, 46);

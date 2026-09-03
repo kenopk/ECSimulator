@@ -6,6 +6,7 @@
 #include <QPair>
 #include "pin.h"
 #include "component.h"
+#include <QShortcut>
 
 class Wire;
 
@@ -21,7 +22,7 @@ public:
     bool isWireMode() const { return m_wireMode; }
 
     // snapToGrid теперь возвращает QPoint (целое)
-        static QPoint snapToGrid(const QPointF &pos, qreal gridSize = kGridSize);
+    static QPoint snapToGrid(const QPointF &pos, qreal gridSize = kGridSize);
 
     void deleteSelectedItems();
     void undo();
@@ -60,12 +61,12 @@ protected:
     void mouseReleaseEvent(QMouseEvent *event) override;
     void keyPressEvent(QKeyEvent *event) override;
     void contextMenuEvent(QContextMenuEvent *event) override;
-    QPoint Counter_Steps(QKeyEvent *event); // <-- возвращает QPoint
+    QPoint countSteps(QKeyEvent *event); // шаг стрелок: базовый 50, с Shift — 200
     void leaveEvent(QEvent *event) override;
     void mouseDoubleClickEvent(QMouseEvent *event) override;
 
 private:
-    Wire* findWireAt(const QPoint &scenePos, qreal maxDist); // <-- QPoint
+    // findWireAt(const QPoint&, qreal) удалён как неиспользуемый (dead code).
     Wire* findWireEndpointNear(const QPoint &scenePos, bool *isStart); // <-- QPoint
 
     bool m_panning = false;
@@ -91,11 +92,15 @@ private:
     void clearHover();
     QPoint findFreePosition(const QPoint &desiredStart, const QPoint &delta, qreal step); // <-- QPoint
     QPoint m_lastPastePos;   // <-- QPoint
-    bool m_hasPasted;
+    bool m_hasPasted = false;
     bool m_componentMode = false;
     ComponentType m_componentType = ComponentType::Resistor;
 
     QVector<QPair<Wire*, bool>> m_connectedWiresAtPress;
     void collectNodeWires(const QPoint &anchor);
     Qt::CursorShape m_preferredCursor = Qt::ArrowCursor;   // по умолчанию — стрелка
+
+    QShortcut *m_wireShortcut = nullptr;
+    QShortcut *m_resistorShortcut = nullptr;
+    QShortcut *m_capacitorShortcut = nullptr;
 };
