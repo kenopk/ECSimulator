@@ -103,4 +103,5 @@ private:
     QShortcut *m_wireShortcut = nullptr;
     QShortcut *m_resistorShortcut = nullptr;
     QShortcut *m_capacitorShortcut = nullptr;
+    QShortcut *m_polarCapacitorShortcut = nullptr;
 };

@@ -22,7 +22,7 @@ public slots:
     // === ПУБЛИЧНЫЕ СЛОТЫ ===
     // Эти методы могут вызываться из других классов (например, из MainWindow)
     void onNewProject();
-    void onOpenProject();       // <-- Теперь этот слот публичный, ошибка исчезнет
+    void onOpenProject();
 
     // Слоты для зума и сброса вида (тоже могут вызываться извне, если нужно)
     void onZoomIn();
@@ -38,7 +38,7 @@ private slots:
     void showTabContextMenu(int index, const QPoint &globalPos);
     void onUndo();
     void onRedo();
-    void updateUndoRedoActions();
+    void updateEditActionsState();   // обновляет checked/enabled всех действий редактирования
 
 signals:
     void backToMainMenu();
@@ -47,9 +47,19 @@ private:
     // Внутренние методы настройки и логики
     void setupUI();
     void createNewTab(const QString &title);
-    void Draw_Edit_Menu(QMenu *menu);   // используется ТОЛЬКО для временного контекстного меню (ПКМ)
-    void buildPersistentEditMenu(QMenu *menu);   // строит меню "Edit" в menu bar ОДИН раз
-    void updatePersistentEditMenuState();        // обновляет checked/enabled на каждый aboutToShow
+
+    // Создаёт ВСЕ QAction'ы редактирования (Wire/Resistor/Cap/Select/Delete/
+    // Copy/Cut/Paste/Undo/Redo) один раз. Дальше эти же объекты добавляются
+    // и в постоянное меню "Edit"/"Правка" в menu bar, и во временное
+    // контекстное меню по ПКМ (contextMenuEvent) — Qt позволяет один QAction
+    // показывать сразу в нескольких QMenu, поэтому не нужно строить два
+    // параллельных набора пунктов меню с одинаковой логикой.
+    void createEditActions();
+
+    // Наполняет переданное меню общими действиями редактирования
+    // (используется и для постоянного, и для временного меню).
+    void populateEditMenu(QMenu *menu);
+
     QString generateUniqueTabName(const QString &baseName);
 
     // Вспомогательные функции
@@ -60,24 +70,25 @@ private:
     void contextMenuEvent(QContextMenuEvent *event) override;
 
     // Указатель на виджет вкладок
-    //QTabWidget *tabWidget;
-    QTabWidget *tabWidget = nullptr;  // ← добавили = nullptr
+    QTabWidget *tabWidget = nullptr;
 
+    // Общие действия редактирования — см. createEditActions()/populateEditMenu().
     QAction *undoAction = nullptr;
     QAction *redoAction = nullptr;
-
-    // Постоянное меню "Edit" — создаётся один раз в setupUI(), затем только
-    // обновляется через updatePersistentEditMenuState() (см. .cpp).
-    QMenu *m_editMenu = nullptr;
-    QAction *m_wireMenuAction = nullptr;
-    QAction *m_resistorMenuAction = nullptr;
-    QAction *m_capMenuAction = nullptr;
-    QAction *m_selectMenuAction = nullptr;
-    QAction *m_deleteMenuAction = nullptr;
+    QAction *m_wireAction = nullptr;
+    QAction *m_resistorAction = nullptr;
+    QAction *m_capAction = nullptr;
+    QAction *m_selectAction = nullptr;
+    QAction *m_deleteAction = nullptr;
+    QAction *m_copyAction = nullptr;
+    QAction *m_cutAction = nullptr;
+    QAction *m_pasteAction = nullptr;
 
     void createSettingsTab();
     QColor m_backgroundColor = QColor(30, 30, 46);
-    Qt::CursorShape m_cursorShape = Qt::ArrowCursor;   // было OpenHandCursor;
+    Qt::CursorShape m_cursorShape = Qt::ArrowCursor;
+
+    QAction *m_polarCapAction = nullptr;
 };
 
 #endif // EDITORWINDOW_H

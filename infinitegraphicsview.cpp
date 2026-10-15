@@ -51,6 +51,9 @@ QPoint ensureMinComponentLength(ComponentType type,
     case ComponentType::Non_Polar_Capacitor:
         minLen = kMinLength;
         break;
+    case ComponentType::Polar_Capacitor: // <-- ДОБАВИТЬ
+        minLen = kMinLength;
+        break;
     default:
         return movePos;
     }
@@ -487,6 +490,15 @@ InfiniteGraphicsView::InfiniteGraphicsView(QWidget *parent)
             setComponentMode(ComponentType::Non_Polar_Capacitor);
     });
 
+    m_polarCapacitorShortcut = new QShortcut(QKeySequence(Qt::Key_E), this); // E от Electrolytic
+    m_polarCapacitorShortcut->setContext(Qt::WidgetWithChildrenShortcut);
+    connect(m_polarCapacitorShortcut, &QShortcut::activated, this, [this]() {
+        if (isComponentMode() && currentComponentType() == ComponentType::Polar_Capacitor)
+            disableComponentMode();
+        else
+            setComponentMode(ComponentType::Polar_Capacitor);
+    });
+
     setTransformationAnchor(QGraphicsView::AnchorViewCenter);
     setResizeAnchor(QGraphicsView::AnchorViewCenter);
     setViewportUpdateMode(QGraphicsView::SmartViewportUpdate);
@@ -893,7 +905,7 @@ void InfiniteGraphicsView::mousePressEvent(QMouseEvent *event) {
         QGraphicsItem *itemUnderCursor = itemAt(event->pos());
         if (itemUnderCursor && (itemUnderCursor->flags() & QGraphicsItem::ItemIsSelectable)) {
             if (!itemUnderCursor->isSelected()) {
-                scene()->clearSelection();
+
                 itemUnderCursor->setSelected(true);
             }
             viewport()->update();
@@ -987,7 +999,6 @@ void InfiniteGraphicsView::mousePressEvent(QMouseEvent *event) {
         }
         if (wireUnderCursor) {
             if (!wireUnderCursor->isSelected()) {
-                scene()->clearSelection();
                 wireUnderCursor->setSelected(true);
             }
             m_movingWires.clear();
@@ -1609,6 +1620,45 @@ void InfiniteGraphicsView::mouseDoubleClickEvent(QMouseEvent *event)
                                       comp->setParam("tolerance", v[2]);
                                       m_undoStack->push(new ChangeParamCommand(comp, "esr", oldE, v[3]));
                                       comp->setParam("esr", v[3]);
+                                      m_undoStack->endMacro();
+                                  });
+        event->accept();
+        return;
+    }
+
+    // ================= ПОЛЯРНЫЙ КОНДЕНСАТОР =================
+    if (comp->componentType() == ComponentType::Polar_Capacitor) {
+        const double curV = comp->param("voltage").toDouble();
+        QVector<ParamField> fields;
+        fields.append({ "Ёмкость:", comp->capacitance(), 0.0, 1.0, 0, 0.0, ParamField::CapText });
+        fields.append({ "Напряжение (В):", curV > 0 ? curV : 25.0, 1.0, 10000.0, 1, 1.0, ParamField::Spin });
+        fields.append({ "Точность (%):", comp->param("tolerance").toDouble(), 0.0, 100.0, 1, 1.0, ParamField::Spin });
+        fields.append({ "ESR (Ом):", comp->param("esr").toDouble(), 0.0, 1000.0, 3, 0.1, ParamField::Spin });
+        fields.append({ "Ток утечки (мкА):", comp->param("leakage_uA").toDouble(), 0.0, 10000.0, 1, 1.0, ParamField::Spin }); // <-- Новое поле
+
+        showComponentParamsDialog(this, "Параметры полярного конденсатора", fields,
+                                  [this, comp](const QVector<double> &v) {
+                                      const double oldC = comp->capacitance();
+                                      const double oldV = comp->param("voltage").toDouble();
+                                      const double oldT = comp->param("tolerance").toDouble();
+                                      const double oldE = comp->param("esr").toDouble();
+                                      const double oldL = comp->param("leakage_uA").toDouble();
+
+                                      if (qAbs(v[0]-oldC) < 1e-15 && qAbs(v[1]-oldV) < 1e-6 &&
+                                          qAbs(v[2]-oldT) < 1e-6  && qAbs(v[3]-oldE) < 1e-6 && qAbs(v[4]-oldL) < 1e-6)
+                                          return;
+
+                                      m_undoStack->beginMacro("Изменение параметров полярного конденсатора");
+                                      m_undoStack->push(new ChangeParamCommand(comp, "capacitance", oldC, v[0]));
+                                      comp->setCapacitance(v[0]);
+                                      m_undoStack->push(new ChangeParamCommand(comp, "voltage", oldV, v[1]));
+                                      comp->setParam("voltage", v[1]);
+                                      m_undoStack->push(new ChangeParamCommand(comp, "tolerance", oldT, v[2]));
+                                      comp->setParam("tolerance", v[2]);
+                                      m_undoStack->push(new ChangeParamCommand(comp, "esr", oldE, v[3]));
+                                      comp->setParam("esr", v[3]);
+                                      m_undoStack->push(new ChangeParamCommand(comp, "leakage_uA", oldL, v[4])); // <-- Сохраняем
+                                      comp->setParam("leakage_uA", v[4]);
                                       m_undoStack->endMacro();
                                   });
         event->accept();

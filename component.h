@@ -9,6 +9,7 @@ enum class ComponentType {
     Non_Polar_Capacitor,
     Inductor,
     Diode,
+    Polar_Capacitor
     // ... добавляйте новые
 };
 

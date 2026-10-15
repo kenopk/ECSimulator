@@ -69,26 +69,3 @@ void InfiniteGraphicsScene::drawBackground(QPainter *painter, const QRectF &rect
         painter->drawLine(QPointF(rect.left(), y), QPointF(rect.right(), y));
     }
 }
-
-void InfiniteGraphicsScene::drawForeground(QPainter *painter, const QRectF &rect) {
-    Q_UNUSED(rect);
-
-    // Общая рамка выделения: рисуется ПОСЛЕ всех объектов сцены (см. комментарий
-    // в .h), поэтому видна целиком, не перекрытая ни одним проводом/компонентом.
-    const QList<QGraphicsItem*> selected = selectedItems();
-    if (selected.isEmpty()) return;
-
-    QRectF unionRect;
-    for (QGraphicsItem *item : selected) {
-        const QRectF r = item->sceneBoundingRect();
-        unionRect = unionRect.isNull() ? r : unionRect.united(r);
-    }
-
-    QPen pen(QColor(255, 200, 0, 220));
-    pen.setStyle(Qt::DashLine);
-    pen.setCosmetic(true);   // толщина рамки не зависит от зума, как и у сетки выше
-
-    painter->setPen(pen);
-    painter->setBrush(Qt::NoBrush);
-    painter->drawRect(unionRect.adjusted(-4, -4, 4, 4));
-}

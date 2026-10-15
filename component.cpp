@@ -149,15 +149,22 @@ Component::Component(Pin startPin, Pin endPin, ComponentType type, QGraphicsItem
 {
     switch (type) {
     case ComponentType::Resistor:
-        m_params["resistance"] = 1000.0;
-        m_params["power"]      = 0.25;
-        m_params["accuracy"]   = 5.0;
+        m_params["resistance"] = 1000.0;    // сопротивление
+        m_params["power"]      = 0.25;      // Мощность
+        m_params["accuracy"]   = 5.0;       // Точность
         break;
     case ComponentType::Non_Polar_Capacitor:
-        m_params["capacitance"] = 10e-6;
-        m_params["voltage"]     = 5.0;
-        m_params["tolerance"]   = 10;
-        m_params["esr"]         = 0.1;
+        m_params["capacitance"] = 10e-6;    // Емкость
+        m_params["voltage"]     = 5.0;      // Напряжение
+        m_params["tolerance"]   = 10;       // Точность
+        m_params["esr"]         = 0.1;      // Эквивалентное последовательное сопротивление (по-русски часто сокращают до ЭПС).
+        break;
+    case ComponentType::Polar_Capacitor:
+        m_params["capacitance"] = 100e-6;   // 100 мкФ (типичное значение)
+        m_params["voltage"]     = 25.0;     // 25 Вольт
+        m_params["tolerance"]   = 20.0;     // ±20%
+        m_params["esr"]         = 0.5;      // 0.5 Ом (выше, чем у неполярных)
+        m_params["leakage_uA"]  = 5.0;      // Ток утечки в микроамперах
         break;
     default: break;
     }
@@ -202,7 +209,7 @@ void Component::paint(QPainter *painter, const QStyleOptionGraphicsItem *option,
     QPen pen;
     if (isHovered() || isSelected()) pen = QPen(QColor(0, 255, 255), 2);
     else                             pen = QPen(Qt::green, 2);
-    pen.setCapStyle(Qt::RoundCap);
+    pen.setCapStyle(Qt::FlatCap);
     pen.setJoinStyle(Qt::MiterJoin);
 
     QFont f = painter->font();
@@ -283,6 +290,66 @@ void Component::paint(QPainter *painter, const QStyleOptionGraphicsItem *option,
         return;
     }
 
+    if (m_type == ComponentType::Polar_Capacitor) {
+        const ResistorGeometry g = makeResistorGeometry(axis);
+        painter->setBrush(Qt::NoBrush);
+        if (!g.valid) { painter->setPen(pen); painter->drawLine(axis); return; }
+
+        const QPointF d = g.p2 - g.p1;
+        const qreal len = std::hypot(d.x(), d.y());
+        const QPointF u = (len > 1e-6) ? (d / len) : QPointF(1, 0);
+        const QPointF n(-u.y(), u.x());
+        const QPointF center = (g.p1 + g.p2) / 2.0;
+
+        const qreal plateHalf = kCapPlateHeight / 2.0;
+        const qreal gapHalf   = kCapGap / 2.0;
+        const QPointF leftPlate  = center - u * gapHalf;   // Анод (+)
+        const QPointF rightPlate = center + u * gapHalf;   // Катод (-)
+
+        // 1. Рисуем выводы
+        painter->setPen(pen);
+        painter->drawLine(g.p1, leftPlate);
+        painter->drawLine(g.p2, rightPlate);
+
+        // 2. Рисуем обе пластины ПРЯМЫМИ (как у неполярного)
+        QPen platePen = pen;
+        platePen.setWidthF(kCapPlateThickness);
+        platePen.setCapStyle(Qt::FlatCap);
+        painter->setPen(platePen);
+        painter->drawLine(leftPlate  - n * plateHalf, leftPlate  + n * plateHalf);
+        painter->drawLine(rightPlate - n * plateHalf, rightPlate + n * plateHalf);
+
+        // 3. Знак "+" возле анода
+        QPen plusPen = pen;
+        plusPen.setWidthF(1.0);          // тонкое перо
+        plusPen.setCapStyle(Qt::FlatCap);// без скруглений
+        painter->setPen(plusPen);
+        const qreal plusSize = 4.0;      // было 3.0 — с тонким пером знак читаемее
+        const QPointF plusCenter = leftPlate - u * kCapGap - n * (plateHalf + 1.0);
+        painter->drawLine(plusCenter - QPointF(0, plusSize / 2.0),
+                          plusCenter + QPointF(0, plusSize / 2.0));
+        painter->drawLine(plusCenter - QPointF(plusSize / 2.0, 0),
+                          plusCenter + QPointF(plusSize / 2.0, 0));
+        // 4. Точки подключения (как у остальных)
+        painter->setPen(Qt::NoPen);
+        if (!isStartConnected()) {
+            painter->setBrush(isStartNearOther() ? Qt::red : Qt::white);
+            painter->drawEllipse(g.p1, 2.0, 2.0);
+        }
+        if (!isEndConnected()) {
+            painter->setBrush(isEndNearOther() ? Qt::red : Qt::white);
+            painter->drawEllipse(g.p2, 2.0, 2.0);
+        }
+
+        // 5. Текст (ёмкость)
+        const QString valueStr = formatCapacitanceShort(capacitance());
+        const QRectF upRect = capacitorTextRect(g, capacitance(), false);
+        const QRectF dnRect = capacitorTextRect(g, capacitance(), true);
+        painter->setPen(Qt::white);
+        painter->drawText(labelFlipped(this, upRect, dnRect) ? dnRect : upRect, Qt::AlignCenter, valueStr);
+        return;
+    }
+
     painter->setPen(pen);
     painter->drawLine(axis);
     painter->setPen(Qt::NoPen);
@@ -310,7 +377,11 @@ QRectF Component::boundingRect() const
     } else if (m_type == ComponentType::Non_Polar_Capacitor) {
         rect = rect.united(capacitorTextRect(g, capacitance(), false))
         .united(capacitorTextRect(g, capacitance(), true));
+    } else if (m_type == ComponentType::Polar_Capacitor) { // <-- ДОБАВИТЬ
+        rect = rect.united(capacitorTextRect(g, capacitance(), false))
+                   .united(capacitorTextRect(g, capacitance(), true));
     }
+
     return rect.adjusted(-2.0, -2.0, 2.0, 2.0);
 }
 
@@ -391,7 +462,58 @@ QPainterPath Component::shape() const
 
             result = body.united(outline).united(leadsStroke).united(dots);
         }
-    } else {
+    } else if (m_type == ComponentType::Polar_Capacitor) {
+        const ResistorGeometry g = makeResistorGeometry(line());
+        if (!g.valid) {
+            result = Wire::shape();
+        } else {
+            const QPointF d = g.p2 - g.p1;
+            const qreal len = std::hypot(d.x(), d.y());
+            const QPointF u = (len > 1e-6) ? (d / len) : QPointF(1, 0);
+            const QPointF n(-u.y(), u.x());
+            const QPointF center = (g.p1 + g.p2) / 2.0;
+
+            const qreal plateHalf = kCapPlateHeight / 2.0;
+            const qreal gapHalf   = kCapGap / 2.0;          // <-- зазор из общей переменной
+            const QPointF leftPlate  = center - u * gapHalf;
+            const QPointF rightPlate = center + u * gapHalf;
+
+            QPainterPath path;
+            // Выводы
+            path.moveTo(g.p1); path.lineTo(leftPlate);
+            path.moveTo(g.p2); path.lineTo(rightPlate);
+            // Обе пластины ПРЯМЫЕ (как в paint, без cubicTo)
+            path.moveTo(leftPlate  - n * plateHalf); path.lineTo(leftPlate  + n * plateHalf);
+            path.moveTo(rightPlate - n * plateHalf); path.lineTo(rightPlate + n * plateHalf);
+            // Знак "+" — позиция один-в-один как в paint()
+            const qreal plusSize = 3.0;
+            const QPointF plusCenter = leftPlate - u * kCapGap - n * (plateHalf + 1.0);
+            path.moveTo(plusCenter - QPointF(0, plusSize / 2.0));
+            path.lineTo(plusCenter + QPointF(0, plusSize / 2.0));
+            path.moveTo(plusCenter - QPointF(plusSize / 2.0, 0));
+            path.lineTo(plusCenter + QPointF(plusSize / 2.0, 0));
+
+            QPainterPathStroker stroker;
+            stroker.setWidth(2.0);
+            stroker.setCapStyle(Qt::FlatCap);
+            QPainterPath stroke = stroker.createStroke(path);
+
+            // Зазор между пластинами тоже кликабелен (как у неполярного)
+            QPainterPath gap;
+            gap.addPolygon(QPolygonF() << (leftPlate  - n * plateHalf)
+                                       << (leftPlate  + n * plateHalf)
+                                       << (rightPlate + n * plateHalf)
+                                       << (rightPlate - n * plateHalf));
+            gap.closeSubpath();
+
+            QPainterPath dots;
+            dots.addEllipse(g.p1, 2.0, 2.0);
+            dots.addEllipse(g.p2, 2.0, 2.0);
+
+            result = stroke.united(gap).united(dots);
+        }
+    }
+    else {
         result = Wire::shape();
     }
 

@@ -1,4 +1,3 @@
-//#pragma once
 #include "InfiniteGraphicsView.h"
 #include "InfiniteGraphicsScene.h"
 #include "EditorWindow.h"
@@ -17,6 +16,7 @@
 #include <QDebug>
 #include <QFileDialog>
 #include <QFile>
+#include <QDir>
 #include <QTextStream>
 #include <QFileInfo>
 #include <QGraphicsView>
@@ -35,6 +35,25 @@
 #include <cmath>
 #include <functional>
 #include <QLineF>
+
+namespace {
+// Масштаб вида по умолчанию (используется и при создании вкладки, и при
+// "Сбросить вид", и при "По размеру", когда сцена пуста) — раньше это
+// число 2.0 было продублировано в трёх местах по отдельности.
+constexpr qreal kInitialViewScale = 2.0;
+constexpr qreal kZoomStep = 1.25;
+
+// Метка на служебных объектах сцены (оси, деления, подписи "0,0"), которые
+// createNewTab() рисует для ориентации. onFitToSize() должен их игнорировать
+// при расчёте bounding rect пользовательских элементов — раньше это делалось
+// хрупкой эвристикой "длина линии > 300", которая ошибочно исключала бы и
+// длинные провода, если бы пользователь такой нарисовал.
+constexpr int kAuxItemRole = Qt::UserRole + 1;
+
+void markAsAuxItem(QGraphicsItem *item) {
+    if (item) item->setData(kAuxItemRole, true);
+}
+} // namespace
 
 QString buildAppStyleSheet(const QColor &bg)
 {
@@ -94,41 +113,53 @@ QString buildAppStyleSheet(const QColor &bg)
 EditorWindow::EditorWindow(QWidget *parent)
     : QWidget(parent)
 {
-    qDebug() << "EditorWindow::EditorWindow() - создание окна редактора";
     setupUI();
-    qDebug() << "EditorWindow::EditorWindow() - завершено";
 }
 
 void EditorWindow::setupUI() {
-    qDebug() << "EditorWindow::setupUI() - начало настройки интерфейса";
-    //applyTheme(QColor(30, 30, 46));   // изначально темно везде
-
     QVBoxLayout *mainLayout = new QVBoxLayout(this);
     mainLayout->setContentsMargins(0, 0, 0, 0);
     mainLayout->setSpacing(0);
 
     // ---------- Строка меню ----------
     QMenuBar *menuBar = new QMenuBar(this);
+
     // ----- Меню "Файл" -----
     QMenu *fileMenu = menuBar->addMenu("Файл");
-    qDebug() << "  Создано меню 'Файл'";
 
     QAction *newAction = fileMenu->addAction("Новый проект");
     connect(newAction, &QAction::triggered, this, &EditorWindow::onNewProject);
-    qDebug() << "  Добавлено действие 'Новый проект'";
 
     QAction *openAction = fileMenu->addAction("Открыть...");
     connect(openAction, &QAction::triggered, this, &EditorWindow::onOpenProject);
 
-    QAction *saveAction = fileMenu->addAction("Сохранить");
+    // TODO: у проекта пока нет формата сериализации схемы — эти два пункта
+    // намеренно ничего не делают, пока не появится save/load (см. onOpenProject).
+    fileMenu->addAction("Сохранить")->setEnabled(false);
     fileMenu->addSeparator();
+    fileMenu->addAction("Экспортировать как...")->setEnabled(false);
 
-    QAction *exportAction = fileMenu->addAction("Экспортировать как...");
     QAction *exitAction = fileMenu->addAction("Выйти");
     connect(exitAction, &QAction::triggered, this, &EditorWindow::backToMainMenu);
 
-    // ----- Меню "Правка" -----
-    QMenu *PravkaMenu = menuBar->addMenu("Правка");
+    // ---------- Общие действия редактирования ----------
+    // Создаются ОДИН раз и переиспользуются в трёх местах ниже: меню
+    // "Правка", меню "Edit" и временном контекстном меню по ПКМ
+    // (см. contextMenuEvent). Один и тот же QAction можно добавлять сразу
+    // в несколько QMenu — Qt сам следит за синхронизацией checked/enabled
+    // и текста, поэтому не нужно строить три параллельных набора пунктов
+    // с одинаковой логикой и вручную держать их в согласованном состоянии.
+    createEditActions();
+
+    // ----- Меню "Правка" (быстрый доступ: undo/redo + буфер обмена) -----
+    QMenu *quickEditMenu = menuBar->addMenu("Правка");
+    quickEditMenu->addAction(undoAction);
+    quickEditMenu->addAction(redoAction);
+    quickEditMenu->addSeparator();
+    quickEditMenu->addAction(m_copyAction);
+    quickEditMenu->addAction(m_cutAction);
+    quickEditMenu->addAction(m_pasteAction);
+    connect(quickEditMenu, &QMenu::aboutToShow, this, &EditorWindow::updateEditActionsState);
 
     // ----- Меню "Настройки" -----
     QMenu *settingsMenu = menuBar->addMenu("Настройки");
@@ -137,24 +168,6 @@ void EditorWindow::setupUI() {
     settingsMenu->addSeparator();
     QAction *advSettingsAction = settingsMenu->addAction("Доп. настройки");
     connect(advSettingsAction, &QAction::triggered, this, &EditorWindow::createSettingsTab);
-
-    undoAction = new QAction("Отменить", this);
-    undoAction->setShortcut(QKeySequence::Undo);   // Ctrl+Z на всех платформах
-    undoAction->setEnabled(false);
-    connect(undoAction, &QAction::triggered, this, &EditorWindow::onUndo);
-
-    redoAction = new QAction("Повторить", this);
-    redoAction->setShortcut(QKeySequence::Redo);   // Ctrl+Y на Windows
-    redoAction->setEnabled(false);
-    connect(redoAction, &QAction::triggered, this, &EditorWindow::onRedo);
-
-    PravkaMenu->addAction(undoAction);
-    PravkaMenu->addAction(redoAction);
-    PravkaMenu->addSeparator();
-    PravkaMenu->addAction("Копировать");
-    PravkaMenu->addAction("Вставить");
-
-    connect(PravkaMenu, &QMenu::aboutToShow, this, &EditorWindow::updateUndoRedoActions);
 
     // ----- Меню "Вид" -----
     QMenu *viewMenu = menuBar->addMenu("Вид");
@@ -173,165 +186,61 @@ void EditorWindow::setupUI() {
     QAction *resetViewAction = viewMenu->addAction("Сбросить вид");
     connect(resetViewAction, &QAction::triggered, this, &EditorWindow::onResetView);
 
-    // ----- Меню "Edit" -----
-    m_editMenu = menuBar->addMenu("Edit");
-    buildPersistentEditMenu(m_editMenu);   // строится один раз — см. комментарий в .h
-    connect(m_editMenu, &QMenu::aboutToShow, this, [this]() {
-        updatePersistentEditMenuState();
-        updateUndoRedoActions();
-    });
+    // ----- Меню "Edit" (полный набор: типы элементов + правка) -----
+    QMenu *editMenu = menuBar->addMenu("Edit");
+    populateEditMenu(editMenu);
+    connect(editMenu, &QMenu::aboutToShow, this, &EditorWindow::updateEditActionsState);
 
     mainLayout->addWidget(menuBar);
 
     // ---------- Область вкладок ----------
     tabWidget = new QTabWidget(this);
-    qDebug() << " Создан QTabWidget";
     tabWidget->setTabsClosable(true);
     tabWidget->setDocumentMode(true);
     tabWidget->setMovable(true);
-
-    // ДОБАВИТЬ ЭТУ СТРОКУ:
     tabWidget->tabBar()->installEventFilter(this);
 
     mainLayout->addWidget(tabWidget, 1);
 
-    QString initialName = generateUniqueTabName("Проект");
-    qDebug() << "  Создаём начальную вкладку с именем:" << initialName;
-    createNewTab(initialName);
+    createNewTab(generateUniqueTabName("Проект"));
     applyTheme(m_backgroundColor);
 
     connect(tabWidget, &QTabWidget::tabCloseRequested,
             this, &EditorWindow::closeTab);
-
-    qDebug() << "EditorWindow::setupUI() - завершено";
 }
 
 void EditorWindow::contextMenuEvent(QContextMenuEvent *event) {
-    qDebug() << "EditorWindow::contextMenuEvent() - позиция:" << event->pos();
-    //updateUndoRedoActions();          // ← добавить
+    if (!getCurrentView()) return;
+
+    updateEditActionsState();   // актуализировать checked/enabled перед показом
     QMenu menu(this);
-    Draw_Edit_Menu(&menu);
+    populateEditMenu(&menu);
     menu.exec(event->globalPos());
 }
 
-void EditorWindow::Draw_Edit_Menu(QMenu *menu) {
-    qDebug() << "EditorWindow::Draw_Edit_Menu() - заполнение меню элементами";
-    InfiniteGraphicsView *view = getCurrentView();
-
-    if (!view) {
-        qDebug() << "  ОШИБКА: getCurrentView вернул nullptr!";
-        return;  // <-- Добавьте эту проверку
-    }
-
-    QAction *wireAction = menu->addAction("Wire\tw");
-    wireAction->setCheckable(true);
-    wireAction->setChecked(view && view->isWireMode());
-    connect(wireAction, &QAction::triggered, this, [this]() {
-        InfiniteGraphicsView *view = getCurrentView();
-        if (!view) return;
-        view->setWireMode(!view->isWireMode());
-    });
-
-    QAction *resistorAction = menu->addAction("Resistor\tr");
-    resistorAction->setCheckable(true);
-    resistorAction->setChecked(view && view->isComponentMode() &&
-                               view->currentComponentType() == ComponentType::Resistor);
-    connect(resistorAction, &QAction::triggered, this, [this]() {
-        InfiniteGraphicsView *v = getCurrentView();
-        if (!v) return;
-        if (v->isComponentMode() && v->currentComponentType() == ComponentType::Resistor)
-            v->disableComponentMode();
-        else
-            v->setComponentMode(ComponentType::Resistor);
-    });
-
-    QAction *capAction = menu->addAction("Non-polar capacitor\tc");
-    capAction->setCheckable(true);
-    capAction->setChecked(view && view->isComponentMode() &&
-                          view->currentComponentType() == ComponentType::Non_Polar_Capacitor);
-    connect(capAction, &QAction::triggered, this, [this]() {
-        InfiniteGraphicsView *v = getCurrentView();
-        if (!v) return;
-        if (v->isComponentMode() && v->currentComponentType() == ComponentType::Non_Polar_Capacitor)
-            v->disableComponentMode();
-        else
-            v->setComponentMode(ComponentType::Non_Polar_Capacitor);
-    });
-    menu->addAction("Polar capacitor");
-    menu->addSeparator();
-
-    QMenu *MPassive_elements = menu->addMenu("Passive elements");
-    MPassive_elements->addAction("Inductor coil");
-    MPassive_elements->addAction("Switch");
-
-    QMenu *MActive_elements = menu->addMenu("Active elements");
-    MActive_elements->addAction("Diode");
-
-    QMenu *MActive_blocks = menu->addMenu("Active blocks");
-    MActive_blocks->addAction("Operational amplifier ( - top)");
-
-    QMenu *MLogic_elements_Input_Output = menu->addMenu("Logic elements, inputs and outputs");
-    QMenu *MDigital_elements = menu->addMenu("Digital elements");
-    QMenu *MAnalog_and_Hubrid_elements = menu->addMenu("Analog and hybrid elements");
-
-    menu->addSeparator();
-    menu->addAction(undoAction);
-    menu->addAction(redoAction);
-    menu->addSeparator();
-
-    // === НОВОЕ: буфер обмена в меню ===
-    QAction *copyAction = menu->addAction("Копировать\tCtrl+C");
-    connect(copyAction, &QAction::triggered, this, [this]() {
-        if (InfiniteGraphicsView *v = getCurrentView()) v->copySelected();
-    });
-    QAction *cutAction = menu->addAction("Вырезать\tCtrl+X");
-    connect(cutAction, &QAction::triggered, this, [this]() {
-        if (InfiniteGraphicsView *v = getCurrentView()) v->cutSelected();
-    });
-    QAction *pasteAction = menu->addAction("Вставить\tCtrl+V");
-    connect(pasteAction, &QAction::triggered, this, [this]() {
-        if (InfiniteGraphicsView *v = getCurrentView()) v->pasteClipboard();
-    });
-    menu->addSeparator();
-
-    // ---------- Выделить (чекбокс, режим selection) ----------
-    QAction *selectAction = menu->addAction("Выделить");
-    selectAction->setCheckable(true);
-    selectAction->setChecked(view && !view->isWireMode() && !view->isComponentMode());
-    connect(selectAction, &QAction::triggered, this, [this]() {
-        InfiniteGraphicsView *v = getCurrentView();
-        if (v) {
-            v->setWireMode(false);
-            v->disableComponentMode();   // <-- добавить
-        }
-    });
-
-    QAction *deleteAction = menu->addAction("Удалить\t Del");
-    bool hasSelection = view && view->scene() && !view->scene()->selectedItems().isEmpty();
-    deleteAction->setEnabled(hasSelection);
-    connect(deleteAction, &QAction::triggered, this, [this]() {
-        InfiniteGraphicsView *view = getCurrentView();
-        if (view) view->deleteSelectedItems();
-    });
-}
-
 // =============================================================
-// Постоянное меню "Edit" (menu bar) — в отличие от Draw_Edit_Menu()
-// выше (который создаёт временное меню под правым кликом заново
-// при каждом вызове), эти два метода разделяют "построить один раз"
-// и "обновить состояние" — чтобы не плодить QAction/QMenu объекты
-// при каждом открытии меню в menu bar.
+// Общие действия редактирования — см. комментарий в setupUI() и в .h
 // =============================================================
-void EditorWindow::buildPersistentEditMenu(QMenu *menu) {
-    m_wireMenuAction = menu->addAction("Wire\tw");
-    m_wireMenuAction->setCheckable(true);
-    connect(m_wireMenuAction, &QAction::triggered, this, [this]() {
+void EditorWindow::createEditActions() {
+    undoAction = new QAction("Отменить", this);
+    undoAction->setShortcut(QKeySequence::Undo);   // Ctrl+Z на всех платформах
+    undoAction->setEnabled(false);
+    connect(undoAction, &QAction::triggered, this, &EditorWindow::onUndo);
+
+    redoAction = new QAction("Повторить", this);
+    redoAction->setShortcut(QKeySequence::Redo);   // Ctrl+Y на Windows
+    redoAction->setEnabled(false);
+    connect(redoAction, &QAction::triggered, this, &EditorWindow::onRedo);
+
+    m_wireAction = new QAction("Wire\tw", this);
+    m_wireAction->setCheckable(true);
+    connect(m_wireAction, &QAction::triggered, this, [this]() {
         if (auto *v = getCurrentView()) v->setWireMode(!v->isWireMode());
     });
 
-    m_resistorMenuAction = menu->addAction("Resistor\tr");
-    m_resistorMenuAction->setCheckable(true);
-    connect(m_resistorMenuAction, &QAction::triggered, this, [this]() {
+    m_resistorAction = new QAction("Resistor\tr", this);
+    m_resistorAction->setCheckable(true);
+    connect(m_resistorAction, &QAction::triggered, this, [this]() {
         auto *v = getCurrentView();
         if (!v) return;
         if (v->isComponentMode() && v->currentComponentType() == ComponentType::Resistor)
@@ -340,9 +249,9 @@ void EditorWindow::buildPersistentEditMenu(QMenu *menu) {
             v->setComponentMode(ComponentType::Resistor);
     });
 
-    m_capMenuAction = menu->addAction("Non-polar capacitor\tc");
-    m_capMenuAction->setCheckable(true);
-    connect(m_capMenuAction, &QAction::triggered, this, [this]() {
+    m_capAction = new QAction("Non-polar capacitor\tc", this);
+    m_capAction->setCheckable(true);
+    connect(m_capAction, &QAction::triggered, this, [this]() {
         auto *v = getCurrentView();
         if (!v) return;
         if (v->isComponentMode() && v->currentComponentType() == ComponentType::Non_Polar_Capacitor)
@@ -350,68 +259,141 @@ void EditorWindow::buildPersistentEditMenu(QMenu *menu) {
         else
             v->setComponentMode(ComponentType::Non_Polar_Capacitor);
     });
-    menu->addAction("Polar capacitor");
-    menu->addSeparator();
 
-    QMenu *passive = menu->addMenu("Passive elements");
-    passive->addAction("Inductor coil");
-    passive->addAction("Switch");
-
-    QMenu *active = menu->addMenu("Active elements");
-    active->addAction("Diode");
-
-    QMenu *activeBlocks = menu->addMenu("Active blocks");
-    activeBlocks->addAction("Operational amplifier ( - top)");
-
-    menu->addMenu("Logic elements, inputs and outputs");
-    menu->addMenu("Digital elements");
-    menu->addMenu("Analog and hybrid elements");
-
-    menu->addSeparator();
-    menu->addAction(undoAction);
-    menu->addAction(redoAction);
-    menu->addSeparator();
-
-    QAction *copyAction = menu->addAction("Копировать\tCtrl+C");
-    connect(copyAction, &QAction::triggered, this, [this]() {
-        if (auto *v = getCurrentView()) v->copySelected();
+    m_polarCapAction = new QAction("Polar capacitor\te", this);  // шорткат 'e' от Electrolytic
+    m_polarCapAction->setCheckable(true);
+    connect(m_polarCapAction, &QAction::triggered, this, [this]() {
+        auto *v = getCurrentView();
+        if (!v) return;
+        if (v->isComponentMode() && v->currentComponentType() == ComponentType::Polar_Capacitor)
+            v->disableComponentMode();
+        else
+            v->setComponentMode(ComponentType::Polar_Capacitor);
     });
-    QAction *cutAction = menu->addAction("Вырезать\tCtrl+X");
-    connect(cutAction, &QAction::triggered, this, [this]() {
-        if (auto *v = getCurrentView()) v->cutSelected();
-    });
-    QAction *pasteAction = menu->addAction("Вставить\tCtrl+V");
-    connect(pasteAction, &QAction::triggered, this, [this]() {
-        if (auto *v = getCurrentView()) v->pasteClipboard();
-    });
-    menu->addSeparator();
 
-    m_selectMenuAction = menu->addAction("Выделить");
-    m_selectMenuAction->setCheckable(true);
-    connect(m_selectMenuAction, &QAction::triggered, this, [this]() {
+
+    m_selectAction = new QAction("Выделить", this);
+    m_selectAction->setCheckable(true);
+    connect(m_selectAction, &QAction::triggered, this, [this]() {
         if (auto *v = getCurrentView()) {
             v->setWireMode(false);
             v->disableComponentMode();
         }
     });
 
-    m_deleteMenuAction = menu->addAction("Удалить\t Del");
-    connect(m_deleteMenuAction, &QAction::triggered, this, [this]() {
+    m_deleteAction = new QAction("Удалить\t Del", this);
+    connect(m_deleteAction, &QAction::triggered, this, [this]() {
         if (auto *v = getCurrentView()) v->deleteSelectedItems();
     });
 
-    updatePersistentEditMenuState();   // сразу выставить корректное начальное состояние
+    m_copyAction = new QAction("Копировать\tCtrl+C", this);
+    connect(m_copyAction, &QAction::triggered, this, [this]() {
+        if (auto *v = getCurrentView()) v->copySelected();
+    });
+
+    m_cutAction = new QAction("Вырезать\tCtrl+X", this);
+    connect(m_cutAction, &QAction::triggered, this, [this]() {
+        if (auto *v = getCurrentView()) v->cutSelected();
+    });
+
+    m_pasteAction = new QAction("Вставить\tCtrl+V", this);
+    connect(m_pasteAction, &QAction::triggered, this, [this]() {
+        if (auto *v = getCurrentView()) v->pasteClipboard();
+    });
 }
 
-void EditorWindow::updatePersistentEditMenuState() {
+// Наполняет любое переданное меню полным набором действий редактирования
+// схемы. Используется и для постоянного меню "Edit" (создаётся один раз),
+// и для временного контекстного меню по ПКМ (создаётся заново при каждом
+// вызове contextMenuEvent — сами QAction при этом не пересоздаются,
+// пересоздаются только пункты-заглушки без логики, вроде "Passive elements").
+void EditorWindow::populateEditMenu(QMenu *menu) {
+    // --- Верхний уровень: базовые инструменты ---
+    menu->addAction(m_wireAction);
+    menu->addAction(m_resistorAction);
+    menu->addAction(m_capAction);          // неполярный конденсатор — остаётся здесь
+    menu->addSeparator();
+
+    // --- Пассивные элементы ---
+    QMenu *passive = menu->addMenu("Passive elements");
+    passive->addAction(m_polarCapAction);             // конденсатор (полярный) — уже реализован
+    passive->addSeparator();
+    passive->addAction("Inductor coil");              // катушка индуктивности (L)
+    passive->addAction("Switch");                     // выключатель (s)
+    passive->addAction("Push button");                // кнопка
+    passive->addAction("SPDT switch");                // SPDT переключатель (S)
+    passive->addAction("DPDT switch");                // DPDT переключатель
+    passive->addAction("Make-before-break switch");   // переключатель с перекрывающими контактами
+    passive->addAction("Potentiometer");              // потенциометр
+    passive->addAction("Transformer");                // трансформатор (T)
+    passive->addAction("Tapped transformer");         // трансформатор с отводом
+    passive->addAction("Custom transformer");         // пользовательский трансформатор
+    passive->addAction("Transmission line");          // линия электропередачи
+    passive->addAction("Relay");                      // реле (R)
+    passive->addAction("Relay coil");                 // катушка реле
+    passive->addAction("Relay contact");              // контакт реле
+    passive->addAction("Photoresistor");              // фоторезистор
+    passive->addAction("Thermistor");                 // термистор
+    passive->addAction("Memristor");                  // мемристор
+    passive->addAction("Spark gap");                  // искровой промежуток
+    passive->addAction("Fuse");                       // плавкий предохранитель
+    passive->addAction("Quartz resonator");           // кварцевый резонатор
+    passive->addAction("Cross switch");               // перекрёстный переключатель
+    passive->addAction("Gyrator");                    // гиратор
+
+    // --- Остальные секции без изменений ---
+    QMenu *active = menu->addMenu("Active elements");
+    active->addAction("Diode");
+    QMenu *activeBlocks = menu->addMenu("Active blocks");
+    activeBlocks->addAction("Operational amplifier ( - top)");
+    menu->addMenu("Logic elements, inputs and outputs");
+    menu->addMenu("Digital elements");
+    menu->addMenu("Analog and hybrid elements");
+    menu->addSeparator();
+    menu->addAction(undoAction);
+    menu->addAction(redoAction);
+    menu->addSeparator();
+    menu->addAction(m_copyAction);
+    menu->addAction(m_cutAction);
+    menu->addAction(m_pasteAction);
+    menu->addSeparator();
+    menu->addAction(m_selectAction);
+    menu->addAction(m_deleteAction);
+}
+
+// Обновляет checked/enabled/текст для ВСЕХ общих действий редактирования
+// разом — вызывается перед показом любого из трёх мест, где они видны
+// (Правка/Edit через aboutToShow, контекстное меню — явно в contextMenuEvent),
+// а также после undo()/redo(), чтобы шорткаты Ctrl+Z/Ctrl+Y сразу обновляли
+// состояние, даже если ни одно меню не открывалось.
+void EditorWindow::updateEditActionsState() {
     InfiniteGraphicsView *view = getCurrentView();
-    m_wireMenuAction->setChecked(view && view->isWireMode());
-    m_resistorMenuAction->setChecked(view && view->isComponentMode() &&
-                                     view->currentComponentType() == ComponentType::Resistor);
-    m_capMenuAction->setChecked(view && view->isComponentMode() &&
-                                view->currentComponentType() == ComponentType::Non_Polar_Capacitor);
-    m_selectMenuAction->setChecked(view && !view->isWireMode() && !view->isComponentMode());
-    m_deleteMenuAction->setEnabled(view && view->scene() && !view->scene()->selectedItems().isEmpty());
+
+    const bool canUndo = view && view->canUndo();
+    const bool canRedo = view && view->canRedo();
+    undoAction->setEnabled(canUndo);
+    redoAction->setEnabled(canRedo);
+    undoAction->setText(canUndo ? "Отменить: " + view->undoText() : "Отменить");
+    redoAction->setText(canRedo ? "Повторить: " + view->redoText() : "Повторить");
+
+    const bool wireMode = view && view->isWireMode();
+    const bool isResistorMode = view && view->isComponentMode() &&
+                                view->currentComponentType() == ComponentType::Resistor;
+    const bool isCapMode = view && view->isComponentMode() &&
+                           view->currentComponentType() == ComponentType::Non_Polar_Capacitor;
+
+    m_wireAction->setChecked(wireMode);
+    m_resistorAction->setChecked(isResistorMode);
+    m_capAction->setChecked(isCapMode);
+    m_selectAction->setChecked(view && !wireMode && !view->isComponentMode());
+    m_deleteAction->setEnabled(view && view->scene() && !view->scene()->selectedItems().isEmpty());
+
+    const bool isPolarCapMode = view && view->isComponentMode() &&
+                                view->currentComponentType() == ComponentType::Polar_Capacitor;
+
+    // ... в конце метода:
+    m_capAction->setChecked(isCapMode);
+    m_polarCapAction->setChecked(isPolarCapMode);  // <-- ДОБАВИТЬ
 }
 
 // =============================================================
@@ -419,121 +401,64 @@ void EditorWindow::updatePersistentEditMenuState() {
 // =============================================================
 
 InfiniteGraphicsView* EditorWindow::getCurrentView() const {
-    if (!tabWidget) {
-        qDebug() << "  getCurrentView: tabWidget ещё не создан";
-        return nullptr;
-    }
+    if (!tabWidget) return nullptr;
     QWidget *currentWidget = tabWidget->currentWidget();
-    if (!currentWidget) {
-        qDebug() << "  getCurrentView: currentWidget is null";
-        return nullptr;
-    }
-    QList<QGraphicsView*> views = currentWidget->findChildren<QGraphicsView*>();
-    if (views.isEmpty()) {
-        qDebug() << "  getCurrentView: QGraphicsView не найден";
-        return nullptr;
-    }
-    InfiniteGraphicsView *view = qobject_cast<InfiniteGraphicsView*>(views.first());
-    if (!view) {
-        qDebug() << "  getCurrentView: не удалось привести к InfiniteGraphicsView";
-        return nullptr;
-    }
-    return view;
+    if (!currentWidget) return nullptr;
+    const QList<QGraphicsView*> views = currentWidget->findChildren<QGraphicsView*>();
+    if (views.isEmpty()) return nullptr;
+    return qobject_cast<InfiniteGraphicsView*>(views.first());
 }
+
 // =============================================================
 // СЛОТЫ ДЛЯ ЗУМА И СБРОСА
 // =============================================================
 
 void EditorWindow::onZoomIn() {
-    qDebug() << "EditorWindow::onZoomIn() - увеличение масштаба";
-    InfiniteGraphicsView *view = getCurrentView();
-    if (!view) return;
-
-    qreal factor = 1.25;
-    view->scale(factor, factor);
-    qDebug() << "  масштаб увеличен в" << factor << "раз";
+    if (InfiniteGraphicsView *view = getCurrentView())
+        view->scale(kZoomStep, kZoomStep);
 }
 
 void EditorWindow::onZoomOut() {
-    qDebug() << "EditorWindow::onZoomOut() - уменьшение масштаба";
-    InfiniteGraphicsView *view = getCurrentView();
-    if (!view) return;
-
-    qreal factor = 1.0 / 1.25;
-    view->scale(factor, factor);
-    qDebug() << "  масштаб уменьшен в" << 1.25 << "раз";
+    if (InfiniteGraphicsView *view = getCurrentView())
+        view->scale(1.0 / kZoomStep, 1.0 / kZoomStep);
 }
 
 void EditorWindow::onFitToSize() {
-    qDebug() << "EditorWindow::onFitToSize() - подгонка по размеру";
     InfiniteGraphicsView *view = getCurrentView();
     if (!view) return;
-
     QGraphicsScene *scene = view->scene();
     if (!scene) return;
 
-    // Получаем все элементы на сцене
-    QList<QGraphicsItem*> items = scene->items();
-
-    // Фильтруем только пользовательские элементы (не оси и не текстовые метки)
-    QList<QGraphicsItem*> userItems;
-    for (QGraphicsItem *item : items) {
-        // !!! ИСПРАВЛЕНИЕ: используем qgraphicsitem_cast вместо qobject_cast !!!
-        // QGraphicsItem не является QObject, поэтому qobject_cast для него запрещён.
-
-        // Игнорируем текстовые метки (они созданы через addText)
-        if (qgraphicsitem_cast<QGraphicsTextItem*>(item)) {
-            continue;
-        }
-
-        // Игнорируем линии осей
-        if (auto* line = qgraphicsitem_cast<QGraphicsLineItem*>(item)) {
-            // Пропускаем оси (длинные линии от -200 до 200, их длина = 400)
-            if (line->line().length() > 300) {
-                continue;
-            }
-        }
-
-        // Если это не текст и не длинная линия-ось, считаем это пользовательским объектом
-        userItems.append(item);
+    // Объединяем bounding rect всех НЕ служебных объектов сцены (провода,
+    // компоненты) — служебные (оси, деления, подписи) помечены в
+    // createNewTab() через markAsAuxItem() и пропускаются по метке, а не
+    // по эвристике вроде "длина линии больше 300".
+    QRectF userBounds;
+    for (QGraphicsItem *item : scene->items()) {
+        if (item->data(kAuxItemRole).toBool()) continue;
+        const QRectF r = item->sceneBoundingRect();
+        userBounds = userBounds.isNull() ? r : userBounds.united(r);
     }
 
-    if (userItems.isEmpty()) {
-        // Ничего нет на сцене - сбрасываем в центр с начальным масштабом
-        qDebug() << "  на сцене нет пользовательских объектов, сброс в 0,0 с масштабом 2.0";
+    if (userBounds.isNull()) {
+        // На сцене нет пользовательских объектов — сбрасываем в центр.
         view->resetTransform();
-        view->scale(2.0, 2.0); // Начальный масштаб как в createNewTab
-
-        // Центрируем на (0,0)
+        view->scale(kInitialViewScale, kInitialViewScale);
         view->centerOn(0, 0);
     } else {
-        // ЕСТЬ ОБЪЕКТЫ - заглушка под будущую реализацию
-        qDebug() << "  на сцене найдено" << userItems.size() << "пользовательских объектов(а)";
-        qDebug() << "  TODO: реализовать точную подгонку масштаба под bounding rect этих объектов";
-
-        // Временная реализация: просто центрируем вид на общем прямоугольнике всех объектов сцены
-        QRectF sceneRect = scene->itemsBoundingRect();
-        qDebug() << "  общий bounding rect сцены:" << sceneRect;
-
-        view->centerOn(sceneRect.center());
+        // TODO: сейчас только центрируем; точную подгонку масштаба под
+        // bounding rect (fitInView с учётом отступов) можно добавить позже.
+        view->centerOn(userBounds.center());
     }
 }
 
 void EditorWindow::onResetView() {
-    qDebug() << "EditorWindow::onResetView() - сброс вида";
     InfiniteGraphicsView *view = getCurrentView();
     if (!view) return;
 
-    // Сбрасываем трансформацию (масштаб)
     view->resetTransform();
-
-    // Устанавливаем начальный масштаб
-    view->scale(2.0, 2.0);
-
-    // Центрируем на (0,0)
+    view->scale(kInitialViewScale, kInitialViewScale);
     view->centerOn(0, 0);
-
-    qDebug() << "  вид сброшен: масштаб 2.0, позиция (0,0)";
 }
 
 // =============================================================
@@ -541,8 +466,6 @@ void EditorWindow::onResetView() {
 // =============================================================
 
 void EditorWindow::createNewTab(const QString &title) {
-    qDebug() << "EditorWindow::createNewTab() - создание вкладки с заголовком:" << title;
-
     QWidget *tabContent = new QWidget;
     QVBoxLayout *layout = new QVBoxLayout(tabContent);
     layout->setContentsMargins(0, 0, 0, 0);
@@ -551,71 +474,67 @@ void EditorWindow::createNewTab(const QString &title) {
     view->setPreferredCursor(m_cursorShape);
     InfiniteGraphicsScene *scene = new InfiniteGraphicsScene(view);
     scene->setBackgroundColor(m_backgroundColor);   // фон рисует сцена (drawBackground), не вьюха
-
     scene->setSceneRect(-10000, -10000, 20000, 20000);
-    qDebug() << "  sceneRect установлена: (-10000, -10000, 20000, 20000)";
 
-    // ====== РИСУЕМ ОСИ И МЕТКИ ======
+    // ====== РИСУЕМ ОСИ И МЕТКИ (служебные объекты — см. markAsAuxItem) ======
     QPen axisPen(Qt::white, 1.5);
     QPen tickPen(Qt::gray, 1);
 
-    scene->addLine(-200, 0, 200, 0, axisPen);
-    scene->addLine(0, -200, 0, 200, axisPen);
+    markAsAuxItem(scene->addLine(-200, 0, 200, 0, axisPen));
+    markAsAuxItem(scene->addLine(0, -200, 0, 200, axisPen));
 
     for (int x = -200; x <= 200; x += 50) {
         if (x == 0) continue;
-        scene->addLine(x, -5, x, 5, tickPen);
+        markAsAuxItem(scene->addLine(x, -5, x, 5, tickPen));
         QGraphicsTextItem *text = scene->addText(QString::number(x));
         text->setPos(x - 10, 5);
         text->setDefaultTextColor(Qt::lightGray);
         text->setScale(0.5);
+        markAsAuxItem(text);
     }
 
     for (int y = -200; y <= 200; y += 50) {
         if (y == 0) continue;
-        scene->addLine(-5, y, 5, y, tickPen);
+        markAsAuxItem(scene->addLine(-5, y, 5, y, tickPen));
         QGraphicsTextItem *text = scene->addText(QString::number(y));
         text->setPos(-25, y - 8);
         text->setDefaultTextColor(Qt::lightGray);
         text->setScale(0.5);
+        markAsAuxItem(text);
     }
 
     QGraphicsTextItem *labelX = scene->addText("X");
     labelX->setPos(205, -10);
     labelX->setDefaultTextColor(Qt::white);
     labelX->setScale(1.2);
+    markAsAuxItem(labelX);
 
     QGraphicsTextItem *labelY = scene->addText("Y");
     labelY->setPos(-25, -215);
     labelY->setDefaultTextColor(Qt::white);
     labelY->setScale(1.2);
+    markAsAuxItem(labelY);
 
-    scene->addEllipse(-10, -10, 20, 20, QPen(Qt::red, 2), QBrush(Qt::yellow));
+    markAsAuxItem(scene->addEllipse(-10, -10, 20, 20, QPen(Qt::red, 2), QBrush(Qt::yellow)));
 
     QGraphicsTextItem *centerLabel = scene->addText("0,0");
     centerLabel->setPos(15, -10);
     centerLabel->setDefaultTextColor(Qt::green);
     centerLabel->setScale(0.8);
+    markAsAuxItem(centerLabel);
     // =================================================
 
     view->setScene(scene);
-    view->scale(2.0, 2.0);
+    view->scale(kInitialViewScale, kInitialViewScale);
     view->centerOn(0, 0);
-    qDebug() << "  начальный масштаб 2.0 применён, вид центрирован на (0,0)";
 
     layout->addWidget(view);
 
     int index = tabWidget->addTab(tabContent, title);
-    qDebug() << "  вкладка добавлена, индекс =" << index;
     tabWidget->setCurrentIndex(index);
-    qDebug() << "  текущая вкладка установлена на" << index;
 
-    connect(view->undoStack(), &QUndoStack::canUndoChanged, this, [this]() {
-        updateUndoRedoActions();
-    });
-    connect(view->undoStack(), &QUndoStack::canRedoChanged, this, [this]() {
-        updateUndoRedoActions();
-    });
+    connect(view->undoStack(), &QUndoStack::canUndoChanged, this, &EditorWindow::updateEditActionsState);
+    connect(view->undoStack(), &QUndoStack::canRedoChanged, this, &EditorWindow::updateEditActionsState);
 }
 
 // =============================================================
@@ -623,216 +542,150 @@ void EditorWindow::createNewTab(const QString &title) {
 // =============================================================
 
 void EditorWindow::onNewProject() {
-    qDebug() << "EditorWindow::onNewProject() - создание нового проекта";
-    QString newName = generateUniqueTabName("Проект");
-    qDebug() << "  сгенерировано имя:" << newName;
-    createNewTab(newName);
+    createNewTab(generateUniqueTabName("Проект"));
 }
 
 void EditorWindow::closeTab(int index) {
-    qDebug() << "EditorWindow::closeTab() - закрытие вкладки с индексом" << index;
     QWidget *widget = tabWidget->widget(index);
-    if (widget) {
-        tabWidget->removeTab(index);
-        delete widget;
-        qDebug() << "  вкладка удалена";
-    } else {
-        qDebug() << "  ошибка: виджет не найден";
-    }
+    if (!widget) return;
+    tabWidget->removeTab(index);
+    delete widget;
 }
 
 bool EditorWindow::eventFilter(QObject *obj, QEvent *event) {
-    if (obj == tabWidget->tabBar()) {
-#ifdef QT_DEBUG
-        qDebug() << "eventFilter: событие на панели вкладок, тип =" << event->type();
-#endif
-        if (event->type() == QEvent::MouseButtonDblClick) {
-            QMouseEvent *mouseEvent = static_cast<QMouseEvent*>(event);
-            int index = tabWidget->tabBar()->tabAt(mouseEvent->pos());
-            if (index != -1) {
-                // Вкладку настроек переименовывать НЕЛЬЗЯ
-                QWidget *w = tabWidget->widget(index);
-                if (w && w->property("isSettings").toBool()) {
-                    return true;   // глотаем событие — диалог не откроется
-                }
-                QTimer::singleShot(0, this, [this, index]() {
-                    renameTab(index);
-                });
-                return true;
-            }
-        }
-        else if (event->type() == QEvent::ContextMenu) {
-            QContextMenuEvent *contextEvent = static_cast<QContextMenuEvent*>(event);
-            int index = tabWidget->tabBar()->tabAt(contextEvent->pos());
-            if (index != -1) {
-                qDebug() << "  правый клик по вкладке" << index << "- показ контекстного меню (отложенный вызов)";
-                QPoint globalPos = contextEvent->globalPos();
-                // По той же причине откладываем menu.exec()
-                QTimer::singleShot(0, this, [this, index, globalPos]() {
-                    showTabContextMenu(index, globalPos);
-                });
-                return true;
-            }
-        }
+    if (obj != tabWidget->tabBar()) return QWidget::eventFilter(obj, event);
+
+    if (event->type() == QEvent::MouseButtonDblClick) {
+        auto *mouseEvent = static_cast<QMouseEvent*>(event);
+        const int index = tabWidget->tabBar()->tabAt(mouseEvent->pos());
+        if (index == -1) return QWidget::eventFilter(obj, event);
+
+        // Вкладку настроек переименовывать нельзя.
+        QWidget *w = tabWidget->widget(index);
+        if (w && w->property("isSettings").toBool()) return true;   // глотаем событие
+
+        QTimer::singleShot(0, this, [this, index]() { renameTab(index); });
+        return true;
     }
+
+    if (event->type() == QEvent::ContextMenu) {
+        auto *contextEvent = static_cast<QContextMenuEvent*>(event);
+        const int index = tabWidget->tabBar()->tabAt(contextEvent->pos());
+        if (index == -1) return QWidget::eventFilter(obj, event);
+
+        const QPoint globalPos = contextEvent->globalPos();
+        // Откладываем показ меню тем же способом, что и переименование выше —
+        // чтобы не показывать меню внутри обработки события таббара.
+        QTimer::singleShot(0, this, [this, index, globalPos]() {
+            showTabContextMenu(index, globalPos);
+        });
+        return true;
+    }
+
     return QWidget::eventFilter(obj, event);
 }
 
 void EditorWindow::renameTab(int index) {
-    qDebug() << "EditorWindow::renameTab() - переименование вкладки" << index;
-    QString currentTitle = tabWidget->tabText(index);
-    bool ok;
-    QString newTitle = QInputDialog::getText(this,
-                                             "Переименование",
-                                             "Введите новое имя вкладки:",
-                                             QLineEdit::Normal,
-                                             currentTitle,
-                                             &ok);
-    if (!ok || newTitle.isEmpty()) {
-        qDebug() << "  переименование отменено или пустое имя";
-        return;
-    }
+    const QString currentTitle = tabWidget->tabText(index);
+    bool ok = false;
+    const QString newTitle = QInputDialog::getText(this,
+                                                   "Переименование",
+                                                   "Введите новое имя вкладки:",
+                                                   QLineEdit::Normal,
+                                                   currentTitle,
+                                                   &ok);
+    if (!ok || newTitle.isEmpty()) return;
 
     for (int i = 0; i < tabWidget->count(); ++i) {
         if (i != index && tabWidget->tabText(i) == newTitle) {
             QMessageBox::warning(this, "Ошибка", "Вкладка с таким именем уже существует.");
-            qDebug() << "  ошибка: имя" << newTitle << "уже занято";
             return;
         }
     }
     tabWidget->setTabText(index, newTitle);
-    qDebug() << "  вкладка переименована в" << newTitle;
 }
 
 void EditorWindow::showTabContextMenu(int index, const QPoint &globalPos) {
-    qDebug() << "EditorWindow::showTabContextMenu() - для вкладки" << index;
     QMenu menu(this);
-    QAction *New_tab = menu.addAction("Create");
-    connect(New_tab, &QAction::triggered, this, &EditorWindow::onNewProject);
+    QAction *newTabAction = menu.addAction("Create");
+    connect(newTabAction, &QAction::triggered, this, &EditorWindow::onNewProject);
 
-    bool isSettings = tabWidget->widget(index) &&
-                      tabWidget->widget(index)->property("isSettings").toBool();
+    const bool isSettings = tabWidget->widget(index) &&
+                            tabWidget->widget(index)->property("isSettings").toBool();
 
     QAction *renameAction = menu.addAction("Переименовать");
-    renameAction->setEnabled(!isSettings);   // ← для настроек недоступно
-    connect(renameAction, &QAction::triggered, this, [this, index]() {
-        renameTab(index);
-    });
+    renameAction->setEnabled(!isSettings);   // для вкладки настроек недоступно
+    connect(renameAction, &QAction::triggered, this, [this, index]() { renameTab(index); });
 
     menu.addSeparator();
 
     QAction *closeAction = menu.addAction("Закрыть");
-    connect(closeAction, &QAction::triggered, this, [this, index]() {
-        closeTab(index);
-    });
+    connect(closeAction, &QAction::triggered, this, [this, index]() { closeTab(index); });
 
     QAction *closeAllAction = menu.addAction("Закрыть все");
     connect(closeAllAction, &QAction::triggered, this, [this]() {
-        qDebug() << "  закрыть все вкладки";
-        while (tabWidget->count() > 0) {
-            closeTab(0);
-        }
+        while (tabWidget->count() > 0) closeTab(0);
     });
 
     QAction *closeOthersAction = menu.addAction("Закрыть другие");
     connect(closeOthersAction, &QAction::triggered, this, [this, index]() {
-        qDebug() << "  закрыть другие вкладки, кроме" << index;
-        for (int i = tabWidget->count() - 1; i >= 0; --i) {
-            if (i != index) {
-                closeTab(i);
-            }
-        }
+        for (int i = tabWidget->count() - 1; i >= 0; --i)
+            if (i != index) closeTab(i);
     });
 
     menu.exec(globalPos);
 }
 
 QString EditorWindow::generateUniqueTabName(const QString &baseName) {
-    qDebug() << "EditorWindow::generateUniqueTabName() - базовое имя:" << baseName;
     QStringList existingNames;
-    for (int i = 0; i < tabWidget->count(); ++i) {
+    for (int i = 0; i < tabWidget->count(); ++i)
         existingNames << tabWidget->tabText(i);
-    }
-    if (!existingNames.contains(baseName)) {
-        qDebug() << "  имя свободно, возвращаем" << baseName;
-        return baseName;
-    }
+
+    if (!existingNames.contains(baseName)) return baseName;
+
     int suffix = 2;
-    while (true) {
-        QString candidate = baseName + " (" + QString::number(suffix) + ")";
-        if (!existingNames.contains(candidate)) {
-            qDebug() << "  найдено свободное имя:" << candidate;
-            return candidate;
-        }
+    QString candidate;
+    do {
+        candidate = baseName + " (" + QString::number(suffix) + ")";
         ++suffix;
-    }
+    } while (existingNames.contains(candidate));
+    return candidate;
 }
 
 void EditorWindow::onOpenProject() {
-    qDebug() << "EditorWindow::onOpenProject() - открытие проекта";
-    QString fileName = QFileDialog::getOpenFileName(this,
-                                                    "Открыть проект",
-                                                    QDir::homePath(),
-                                                    "Файлы проектов (*.prj);;Все файлы (*)");
-    if (fileName.isEmpty()) {
-        qDebug() << "  выбор файла отменён";
-        return;
-    }
-    qDebug() << "  выбран файл:" << fileName;
+    const QString fileName = QFileDialog::getOpenFileName(this,
+                                                          "Открыть проект",
+                                                          QDir::homePath(),
+                                                          "Файлы проектов (*.prj);;Все файлы (*)");
+    if (fileName.isEmpty()) return;
 
     for (int i = 0; i < tabWidget->count(); ++i) {
         QWidget *widget = tabWidget->widget(i);
         if (widget->property("filePath").toString() == fileName) {
             tabWidget->setCurrentIndex(i);
-            qDebug() << "  файл уже открыт во вкладке" << i << ", переключаемся";
             return;
         }
     }
 
-    QFileInfo fileInfo(fileName);
-    QString tabTitle = fileInfo.baseName();
-    qDebug() << "  создаём вкладку с именем" << tabTitle;
-    createNewTab(tabTitle);
+    // TODO: тут только заводится вкладка с именем файла — сама схема из
+    // fileName пока никак не десериализуется и не строится на сцене.
+    // Нужен формат сохранения (например, JSON: список проводов/компонентов
+    // с их Pin'ами и m_params) и парная функция saveProject().
+    const QFileInfo fileInfo(fileName);
+    createNewTab(fileInfo.baseName());
 
-    QWidget *currentWidget = tabWidget->currentWidget();
-    if (currentWidget) {
+    if (QWidget *currentWidget = tabWidget->currentWidget())
         currentWidget->setProperty("filePath", fileName);
-        qDebug() << "  путь сохранён в свойстве виджета";
-    }
 }
 
 void EditorWindow::onUndo() {
-    qDebug() << "EditorWindow::onUndo()";
-    InfiniteGraphicsView *view = getCurrentView();
-    if (view) view->undo();
-    updateUndoRedoActions();
+    if (InfiniteGraphicsView *view = getCurrentView()) view->undo();
+    updateEditActionsState();
 }
 
 void EditorWindow::onRedo() {
-    qDebug() << "EditorWindow::onRedo()";
-    InfiniteGraphicsView *view = getCurrentView();
-    if (view) view->redo();
-    updateUndoRedoActions();
-}
-
-void EditorWindow::updateUndoRedoActions() {
-    qDebug() << "updateUndoRedoActions called";
-    InfiniteGraphicsView *view = getCurrentView();
-    if (!view) {
-        qDebug() << "  view is null, disabling actions";
-        undoAction->setEnabled(false);
-        redoAction->setEnabled(false);
-        undoAction->setText("Отменить");
-        redoAction->setText("Повторить");
-        return;
-    }
-    bool canUndo = view->canUndo();
-    bool canRedo = view->canRedo();
-    qDebug() << "  canUndo =" << canUndo << "canRedo =" << canRedo;
-    undoAction->setEnabled(canUndo);
-    redoAction->setEnabled(canRedo);
-    undoAction->setText(canUndo ? "Отменить: " + view->undoText() : "Отменить");
-    redoAction->setText(canRedo ? "Повторить: " + view->redoText() : "Повторить");
+    if (InfiniteGraphicsView *view = getCurrentView()) view->redo();
+    updateEditActionsState();
 }
 
 // =============================================================
@@ -931,9 +784,9 @@ void EditorWindow::createSettingsTab() {
     head->setStyleSheet("font-size:18px; font-weight:bold; background:transparent;");
     lay->addWidget(head);
 
-    // ---------- ТЕМА: выпадающий список ВМЕСТО кнопки ----------
+    // ---------- ТЕМА: выпадающий список ----------
     auto *themeCombo = new QComboBox;
-    themeCombo->addItems({"Тёмный (по умолчанию)", "Белый", "Черный"});  // ← добавили "Черный"
+    themeCombo->addItems({"Тёмный (по умолчанию)", "Белый", "Черный"});
     themeCombo->setFixedWidth(220);
     connect(themeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, [this](int idx) {
@@ -943,22 +796,22 @@ void EditorWindow::createSettingsTab() {
                 case 2:  c = QColor(0, 0, 0); break;         // Черный
                 default: c = QColor(30, 30, 46); break;      // Тёмный (по умолчанию)
                 }
-                applyTheme(c);   // ← сразу во всём приложении
+                applyTheme(c);   // сразу во всём приложении
             });
 
     auto *themeRow = new QHBoxLayout;
     themeRow->setSpacing(12);
     themeRow->addWidget(new QLabel("Тема:"));
     themeRow->addWidget(themeCombo);
-    themeRow->addStretch();           // всё лишнее место — вправо, список слева
+    themeRow->addStretch();
     lay->addLayout(themeRow);
 
-    // ---------- ПАЛИТРА: прижата ВЛЕВО (было по центру) ----------
+    // ---------- ПАЛИТРА ----------
     auto *hexPalette = new HexColorPalette(content);
     hexPalette->onColorPicked = [this](const QColor &c) {
-        applyTheme(c);                // свой оттенок из сот — сразу во всём приложении
+        applyTheme(c);   // свой оттенок из сот — сразу во всём приложении
     };
-    lay->addWidget(hexPalette, 0, Qt::AlignLeft);   // ← было Qt::AlignHCenter
+    lay->addWidget(hexPalette, 0, Qt::AlignLeft);
 
     // ---------- Форма курсора ----------
     auto *curCombo = new QComboBox;
@@ -996,7 +849,7 @@ void EditorWindow::applyTheme(const QColor &bg)
     qApp->setStyleSheet(buildAppStyleSheet(bg));   // всё приложение
     m_backgroundColor = bg;   // запоминаем — используется при создании следующих вкладок
 
-    if (!tabWidget) return;   // ← вкладки ещё не созданы — красить нечего
+    if (!tabWidget) return;   // вкладки ещё не созданы — красить нечего
     for (int i = 0; i < tabWidget->count(); ++i) {
         QWidget *w = tabWidget->widget(i);
         if (!w) continue;
@@ -1013,6 +866,7 @@ void EditorWindow::applyTheme(const QColor &bg)
 void EditorWindow::applyCursorTheme(Qt::CursorShape shape)
 {
     m_cursorShape = shape;
+    if (!tabWidget) return;
     for (int i = 0; i < tabWidget->count(); ++i) {   // сразу во всех вкладках
         QWidget *w = tabWidget->widget(i);
         if (!w) continue;
