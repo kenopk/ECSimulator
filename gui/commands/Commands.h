@@ -77,6 +77,20 @@ private:
     QString m_new;
 };
 
+// Правка клеток карты Карно.
+class ChangeCellsCommand : public QUndoCommand
+{
+public:
+    ChangeCellsCommand(CircuitItem *item, const QVector<quint8> &oldCells, const QVector<quint8> &newCells);
+    void undo() override;
+    void redo() override;
+
+private:
+    CircuitItem *m_item;
+    QVector<quint8> m_old;
+    QVector<quint8> m_new;
+};
+
 // Изменение одного параметра (склеивается при последовательном вводе).
 class ChangeParamCommand : public QUndoCommand
 {

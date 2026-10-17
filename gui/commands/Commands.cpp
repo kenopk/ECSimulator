@@ -122,6 +122,14 @@ ChangeTextCommand::ChangeTextCommand(CircuitItem *item, const QString &oldText, 
 void ChangeTextCommand::redo() { m_item->setText(m_new); }
 void ChangeTextCommand::undo() { m_item->setText(m_old); }
 
+ChangeCellsCommand::ChangeCellsCommand(CircuitItem *item, const QVector<quint8> &oldCells, const QVector<quint8> &newCells)
+    : QUndoCommand(QStringLiteral("Клетка карты Карно")), m_item(item), m_old(oldCells), m_new(newCells)
+{
+}
+
+void ChangeCellsCommand::redo() { m_item->setCells(m_new); }
+void ChangeCellsCommand::undo() { m_item->setCells(m_old); }
+
 ChangeParamCommand::ChangeParamCommand(CircuitItem *item, const QString &key, double oldValue, double newValue)
     : QUndoCommand(QStringLiteral("Изменение параметра")),
       m_item(item), m_key(key), m_old(oldValue), m_new(newValue)

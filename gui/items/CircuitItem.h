@@ -3,11 +3,13 @@
 #include <QGraphicsItem>
 #include <QMap>
 #include <QPainterPath>
+#include <QPointer>
 #include <QPoint>
 #include <QRectF>
 #include <QString>
 #include <QVector>
 
+#include "scope/ScopeSource.h"
 #include "util/CoreTypes.h"
 
 // Один графический элемент схемы: провод или компонент любой сложности.
@@ -28,6 +30,7 @@ public:
     enum { Type = UserType + 1 };
 
     explicit CircuitItem(ElementType type);
+    ~CircuitItem() override;
 
     int type() const override { return Type; }
 
@@ -39,7 +42,7 @@ public:
     int  pinCount() const;
     unsigned variant() const { return m_variant; }
     bool isSinglePin() const { return pinCount() == 1; }
-    bool isMultiPin() const { return pinCount() >= 3; }   // тянуть за вывод нельзя — двигается весь элемент
+    bool isMultiPin() const { return pinCount() >= 3 || pinCount() == 0; }   // тянуть за вывод нельзя — двигается весь элемент
     double toggledValue() const;                          // следующее значение переключателя
     bool isToggle() const;                                // выключатель / кнопка / переключатель
     QString toggleKey() const;
@@ -48,12 +51,22 @@ public:
     bool hasProperties() const;
     // Элементы с отдельно нажимаемыми частями: клавиатура (клавиши) и DIP-переключатель.
     bool hasParts() const;
+    // Карта Карно как элемент: клетки 16×16 по строкам (0, 1, 2 = X). Видны первые «высота × ширина»;
+    // остальные хранятся, чтобы смена размера не стирала введённое. Формула пересчитывается при любой правке.
+    static constexpr int kKarnaughStride = 16;
+    bool isKarnaugh() const { return m_type == ElementType::KarnaughMap; }
+    const QVector<quint8> &cells() const { return m_cells; }
+    void setCells(const QVector<quint8> &cells);
+    const QString &karnaughFormula() const { return m_formula; }
     int  partAt(const QPointF &scenePos) const;            // номер клавиши/переключателя под точкой (1…N), 0 — мимо
     // Параметр, который меняется колесом мыши над элементом (пустая строка — такого нет).
     // secondary — вариант с Shift (номинал у переменных элементов, частота у источников).
     QString wheelKey(bool secondary = false) const;
     // Новое значение параметра key после dir шагов колеса (dir > 0 — увеличить).
     double wheelStep(const QString &key, int dir) const;
+    // Тот же шаг для любого числового параметра (используют поля свойств): ряд E12 для Ω/Ф/Гн, 5 % для процентов,
+    // целые — по единице, остальное — ряд 1-1.5-2-2.5-3-4-5…; результат ограничен [minV, maxV].
+    static double stepValue(const QString &unit, double minV, double maxV, bool integer, double value, int dir);
     QString displayName() const;
 
     // --- геометрия -------------------------------------------------------
@@ -103,6 +116,36 @@ public:
     bool advanceFlow(qreal dt);   // true, если точки тока анимируются
     static void setFlowSpeed(qreal pixelsPerSecond) { s_flowSpeed = pixelsPerSecond; }
 
+    // Осциллограмма: источник отсчётов (напряжение на элементе и ток) создаётся по требованию.
+    // Отсчёты пишутся при каждом setElectrical; время расчёта выставляет ядро через setSimTime.
+    ScopeSource *probe(bool create = false);
+
+    // Постоянный номер элемента: по нему ядро и журнал ссылаются на элемент, не держа указатели.
+    quint64 uid() const { return m_uid; }
+
+    // --- свечение индикаторов ---------------------------------------------------------------
+    // Цвет свечения задаёт пользователь (параметр «glow»), яркость выставляет расчёт: setLight(уровни 0…1).
+    // У светодиода, лампы, неоновой лампы, логического выхода — один уровень; у сегментного индикатора — по числу
+    // ячейкам цифры (у 7 сегментов a…g, затем DP; у нескольких разрядов — блок на каждый разряд подряд); у светодиодной
+    // матрицы — по ячейкам, строка за строкой. Светодиод зажигается сам
+    // по току из setElectrical.
+    static bool isLightEmitter(ElementType type);
+    bool isLightEmitter() const { return isLightEmitter(m_type); }
+    QColor glowColor() const;
+    void setLight(const QVector<double> &levels);
+    // Показание для индикаторов с текстом: цифровой индикатор («12.34»), ЖК-экран (строки через \n), подпись измерительных приборов.
+    void setReadout(const QString &text);
+    const QString &readout() const { return m_readout; }
+    void clearLight();
+
+    // --- подсветка проблемы (остановка симуляции) ---------------------------------------------
+    // Красный ореол вокруг элемента и красные кольца у выводов из маски; снимается clearProblem().
+    void setProblem(quint64 pinMask, bool wholeBody);
+    void clearProblem();
+    bool hasProblem() const { return m_problemBody || m_problemMask != 0; }
+    static void setSimTime(double seconds) { s_simTime = seconds; }
+    static double simTime() { return s_simTime; }
+
     // --- QGraphicsItem ---------------------------------------------------
     QRectF boundingRect() const override;
     QPainterPath shape() const override;
@@ -116,6 +159,7 @@ private:
     QString computeLabel() const;
     unsigned computeVariant() const;
     void refreshVariant();
+    void recomputeKarnaugh();
     void updateLabelRect();
     QPointF toScene(qreal x, qreal y) const;     // локальные координаты -> сцена (с учётом flip)
     int stateValue() const;
@@ -144,5 +188,16 @@ private:
     mutable QPainterPath m_shapeCache;
     mutable bool m_shapeDirty = true;
 
+    QPointer<ScopeSource> m_probe;
+    quint64 m_uid = 0;
+    QVector<double> m_light;
+    QString m_readout;
+    QVector<quint8> m_cells;               // клетки карты Карно (kKarnaughStride × kKarnaughStride)
+    QString m_formula;                     // выбранная формула карты Карно
+    quint64 m_problemMask = 0;
+    bool m_problemBody = false;
+
     static inline qreal s_flowSpeed = 40.0;
+    static inline double s_simTime = 0.0;
+    static inline quint64 s_nextUid = 0;
 };

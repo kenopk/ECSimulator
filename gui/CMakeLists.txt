@@ -20,11 +20,31 @@ set(GUI_SOURCES
     items/CircuitItem.h     items/CircuitItem.cpp
     items/SymbolPainter.h   items/SymbolPainter.cpp   items/SymbolPainterExtra.inc
 
+    project/ProjectFile.h   project/ProjectFile.cpp
+    project/ProjectPanel.h  project/ProjectPanel.cpp
+
+    scope/ScopeDialog.h     scope/ScopeDialog.cpp
+    scope/ScopeMenu.h       scope/ScopeMenu.cpp
+    scope/ScopeSource.h     scope/ScopeSource.cpp
+    scope/ScopePlot.h       scope/ScopePlot.cpp
+    scope/ScopeWidget.h     scope/ScopeWidget.cpp
+    scope/ScopeItem.h       scope/ScopeItem.cpp
+
+    sim/SimIssue.h
+    sim/Preflight.h         sim/Preflight.cpp
+    sim/IssueLog.h          sim/IssueLog.cpp
+    sim/IssueBanner.h       sim/IssueBanner.cpp
+
     theme/Theme.h           theme/Theme.cpp
 
     util/CoreTypes.h
     util/Units.h            util/Units.cpp
 
+    tools/KarnaughSection.h tools/KarnaughSection.cpp
+    tools/KarnaughSolver.h  tools/KarnaughSolver.cpp
+    tools/KarnaughWidget.h  tools/KarnaughWidget.cpp
+
+    widgets/DetachableTabBar.h widgets/DetachableTabBar.cpp
     widgets/ParamForm.h       widgets/ParamForm.cpp
     widgets/PropertiesPanel.h widgets/PropertiesPanel.cpp
     widgets/SimulationPanel.h widgets/SimulationPanel.cpp

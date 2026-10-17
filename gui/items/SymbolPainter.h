@@ -4,6 +4,8 @@
 #include <QPixmap>
 #include <QPoint>
 #include <QPointF>
+#include <QString>
+#include <QVector>
 
 #include "util/CoreTypes.h"
 
@@ -75,6 +77,12 @@ struct PaintContext {
     qreal width = 2.0;          // толщина линий
     qreal textScale = 1.0;      // масштаб надписей внутри символа
     QColor body;                // цвет тела
+    QColor glow;                // цвет свечения (параметр элемента), если элемент светится
+    QVector<double> light;      // яркость каждой светящейся части 0…1 (сегменты, ячейки матрицы); пусто — не светится
+    QString readout;            // показание для индикаторов с текстом: цифровой индикатор («12.34»), ЖК-экран (строки через \n)
+    int digits = 0;             // число знаков цифрового индикатора
+    QVector<quint8> cells;      // клетки карты Карно 16×16 по строкам (0, 1, 2 = X); пусто — все нули
+    QString result;             // формула, которую показывает карта Карно под таблицей
     QColor pin[kMaxPins];       // цвета выводов (по напряжению)
 };
 

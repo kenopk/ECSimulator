@@ -24,6 +24,12 @@ public:
 
     void setRunning(bool on);
 
+    // Строка состояния под кнопками: готова / работает / остановлена из-за ошибки.
+    enum class State { Idle, Running, Error };
+    void setStatus(State state, const QString &text);
+    // Резкая остановка из-за проблемы: кнопка возвращается в «Старт» без сигнала runningChanged.
+    void setStopped(const QString &reason);
+
 signals:
     void resetClicked();
     void runningChanged(bool running);
@@ -36,6 +42,7 @@ private:
     void updateLabels();
 
     QPushButton *m_run = nullptr;
+    QLabel *m_status = nullptr;
     QSlider *m_speed = nullptr;
     QSlider *m_current = nullptr;
     QSlider *m_power = nullptr;

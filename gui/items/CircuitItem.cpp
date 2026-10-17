@@ -1,4 +1,5 @@
 #include "items/CircuitItem.h"
+#include "tools/KarnaughSolver.h"
 
 #include <QFont>
 #include <QFontMetricsF>
@@ -23,11 +24,10 @@ constexpr qreal kMargin = 40.0;          // запас bounding rect под те
 constexpr qreal kFlowSpacing = 14.0;     // шаг точек тока
 constexpr qreal kRedLead = 12.0;         // длина красного «концевого» участка
 
-QFont labelFont(int px = 12)
+// Подпись элемента: номиналы — моноширинным шрифтом, пользовательская «Надпись» — шрифтом интерфейса.
+QFont labelFont(int px, bool mono)
 {
-    QFont f(QStringLiteral("Segoe UI"));
-    f.setPixelSize(px);
-    return f;
+    return mono ? Theme::monoFont(px) : Theme::uiFont(px);
 }
 
 } // namespace
@@ -35,9 +35,14 @@ QFont labelFont(int px = 12)
 CircuitItem::CircuitItem(ElementType type)
     : m_type(type)
 {
+    m_uid = ++s_nextUid;
     for (const auto &pd : elementInfo(type).params)
         m_params.insert(QString::fromUtf8(pd.key), pd.defaultValue);
     m_variant = computeVariant();
+    if (type == ElementType::KarnaughMap) {
+        m_cells.fill(0, kKarnaughStride * kKarnaughStride);
+        recomputeKarnaugh();
+    }
 
     m_p2 = SymbolPainter::normalizeEnd(m_type, m_p1, m_p1, m_variant);       // длина/направление по умолчанию
 
@@ -70,12 +75,110 @@ void CircuitItem::refreshVariant()
     const unsigned v = computeVariant();
     if (v == m_variant)
         return;
+    // Если элемент стоял с длиной «по умолчанию» (её никто не растягивал), то при смене раскладки выводов
+    // (число входов, размер матрицы, объём памяти) длина тоже становится «по умолчанию» для новой раскладки —
+    // иначе после уменьшения у элемента остаются длинные выводы от прежнего размера.
+    const qreal oldLen = length();
+    const bool wasDefault = std::fabs(oldLen - SymbolPainter::defaultLength(m_type, m_variant)) < 1.0;
+
+    prepareGeometryChange();
     m_variant = v;
     m_shapeDirty = true;
-    const QPoint b = SymbolPainter::normalizeEnd(m_type, m_p1, m_p2, m_variant);
-    m_p2 = b;
+
+    QPoint target = m_p2;
+    if (wasDefault && oldLen > 0.0 && !isSinglePin()) {
+        const qreal newLen = SymbolPainter::defaultLength(m_type, m_variant);
+        const QPointF dir = QPointF(m_p2 - m_p1) / oldLen;
+        target = m_p1 + QPoint(qRound(dir.x() * newLen), qRound(dir.y() * newLen));
+    }
+    m_p2 = SymbolPainter::normalizeEnd(m_type, m_p1, target, m_variant);
     updateLabelRect();
     notifyScene();
+    update();
+}
+
+bool CircuitItem::isLightEmitter(ElementType type)
+{
+    switch (type) {
+    case ElementType::LED:
+    case ElementType::Lamp:
+    case ElementType::NeonLamp:
+    case ElementType::LogicOutput:
+    case ElementType::SegDisplay:
+    case ElementType::LedMatrix:
+    case ElementType::LedRGB:
+        return true;
+    default:
+        return false;
+    }
+}
+
+QColor CircuitItem::glowColor() const
+{
+    if (m_type == ElementType::LedRGB) {                // цвет — смесь трёх каналов по их яркости
+        const double r = m_light.value(0), g = m_light.value(1), b = m_light.value(2);
+        const auto ch = [&](double fr, double fg, double fb) {
+            return std::clamp(int(std::lround(fr * r + fg * g + fb * b)), 0, 255);
+        };
+        return QColor(ch(255, 60, 70), ch(70, 255, 120), ch(60, 100, 255));
+    }
+    const auto it = m_params.constFind(QStringLiteral("glow"));
+    if (it == m_params.constEnd())
+        return QColor("#e5483d");
+    return QColor::fromRgb(quint32(std::max(0.0, it.value())) & 0xFFFFFF);
+}
+
+void CircuitItem::setLight(const QVector<double> &levels)
+{
+    if (levels == m_light)
+        return;
+    m_light = levels;
+    update();
+}
+
+void CircuitItem::setReadout(const QString &text)
+{
+    if (text == m_readout)
+        return;
+    m_readout = text;
+    m_label = computeLabel();                           // у приборов показание заменяет подпись
+    updateLabelRect();
+    update();
+}
+
+void CircuitItem::clearLight()
+{
+    if (m_light.isEmpty())
+        return;
+    m_light.clear();
+    update();
+}
+
+void CircuitItem::setProblem(quint64 pinMask, bool wholeBody)
+{
+    if (pinMask == m_problemMask && wholeBody == m_problemBody)
+        return;
+    m_problemMask = pinMask;
+    m_problemBody = wholeBody;
+    update();
+}
+
+void CircuitItem::clearProblem()
+{
+    setProblem(0, false);
+}
+
+CircuitItem::~CircuitItem()
+{
+    if (m_probe)
+        m_probe->targetGone();
+}
+
+ScopeSource *CircuitItem::probe(bool create)
+{
+    if (!m_probe && create)
+        m_probe = new ScopeSource(this, scene());
+    return m_probe;
 }
 
 QString CircuitItem::displayName() const { return QString::fromUtf8(elementInfo(m_type).name); }
@@ -141,7 +244,42 @@ void CircuitItem::setText(const QString &t)
 
 bool CircuitItem::hasParts() const
 {
-    return m_type == ElementType::Keypad || m_type == ElementType::DipSwitch;
+    return m_type == ElementType::Keypad || m_type == ElementType::DipSwitch || m_type == ElementType::KarnaughMap;
+}
+
+void CircuitItem::setCells(const QVector<quint8> &cells)
+{
+    if (!isKarnaugh() || cells.size() != kKarnaughStride * kKarnaughStride || cells == m_cells)
+        return;
+    m_cells = cells;
+    recomputeKarnaugh();
+    update();
+}
+
+// Формула по выбранным клеткам: параметр «Что выводить» — СДНФ, СКНФ, минимальная ДНФ или КНФ.
+void CircuitItem::recomputeKarnaugh()
+{
+    if (!isKarnaugh())
+        return;
+    if (m_cells.size() != kKarnaughStride * kKarnaughStride)
+        m_cells.fill(0, kKarnaughStride * kKarnaughStride);
+    Karnaugh::Input in;
+    in.width = std::clamp(int(std::lround(param(QStringLiteral("width")))), 1, kKarnaughStride);
+    in.height = std::clamp(int(std::lround(param(QStringLiteral("height")))), 1, kKarnaughStride);
+    in.cells.resize(in.width * in.height);
+    for (int r = 0; r < in.height; ++r)
+        for (int c = 0; c < in.width; ++c)
+            in.cells[r * in.width + c] = m_cells[r * kKarnaughStride + c];
+    const Karnaugh::Result res = Karnaugh::solve(in);
+    switch (int(std::lround(param(QStringLiteral("output"))))) {
+    case 0:  m_formula = res.sdnf; break;
+    case 1:  m_formula = res.sknf; break;
+    case 3:  m_formula = res.mknf; break;
+    default: m_formula = res.mdnf; break;
+    }
+    if (m_formula.isEmpty())
+        m_formula = res.note.isEmpty() ? QStringLiteral("0") : QStringLiteral("…");
+    update();
 }
 
 int CircuitItem::partAt(const QPointF &scenePos) const
@@ -285,26 +423,36 @@ QString CircuitItem::wheelKey(bool secondary) const
     return QString::fromLatin1(k);
 }
 
+double CircuitItem::stepValue(const QString &unit, double minV, double maxV, bool integer, double value, int dir)
+{
+    if (dir == 0)
+        return value;
+    const int sign = dir > 0 ? 1 : -1;
+    double r = value;
+    for (int i = 0; i < std::abs(dir); ++i) {
+        if (integer) {
+            r = std::round(r) + sign;
+        } else if (unit == QLatin1String("%")) {
+            r = std::round(r / 5.0) * 5.0 + 5.0 * sign;           // движок и освещённость: шаг 5 %
+        } else if (unit == QString(QChar(0x00B0))) {
+            r = std::round(r / 5.0) * 5.0 + 5.0 * sign;           // углы: шаг 5°
+        } else if (unit == QString(QChar(0x03A9)) || unit == QLatin1String("F") || unit == QLatin1String("H")) {
+            r = stepSeries(r, sign, kE12, 12, false);              // ряд E12 как у настоящих деталей
+        } else {
+            r = stepSeries(r, sign, kNice, 11, minV <= 0.0);
+        }
+        r = std::clamp(r, minV, maxV);
+    }
+    return r;
+}
+
 double CircuitItem::wheelStep(const QString &key, int dir) const
 {
     const ParamDef *pd = findParam(m_type, key);
     const double v = param(key);
     if (!pd || dir == 0)
         return v;
-    const int sign = dir > 0 ? 1 : -1;
-    const QString unit = QString::fromUtf8(pd->unit);
-    double r = v;
-    for (int i = 0; i < std::abs(dir); ++i) {
-        if (unit == QLatin1String("%")) {
-            r = std::round(r / 5.0) * 5.0 + 5.0 * sign;           // движок и освещённость: шаг 5 %
-        } else if (unit == QString(QChar(0x03A9)) || unit == QLatin1String("F") || unit == QLatin1String("H")) {
-            r = stepSeries(r, sign, kE12, 12, false);              // ряд E12 как у настоящих деталей
-        } else {
-            r = stepSeries(r, sign, kNice, 11, pd->minValue <= 0.0);
-        }
-        r = std::clamp(r, pd->minValue, pd->maxValue);
-    }
-    return r;
+    return stepValue(QString::fromUtf8(pd->unit), pd->minValue, pd->maxValue, pd->integer, v, dir);
 }
 
 int CircuitItem::stateValue() const
@@ -415,6 +563,7 @@ void CircuitItem::setParam(const QString &key, double value)
     prepareGeometryChange();
     m_params[key] = value;
     refreshVariant();
+    recomputeKarnaugh();
     m_label = computeLabel();
     updateLabelRect();
     update();
@@ -426,6 +575,7 @@ void CircuitItem::setParams(const QMap<QString, double> &p)
     for (auto it = p.constBegin(); it != p.constEnd(); ++it)
         m_params[it.key()] = it.value();
     refreshVariant();
+    recomputeKarnaugh();
     m_label = computeLabel();
     updateLabelRect();
     update();
@@ -444,6 +594,19 @@ QString CircuitItem::computeLabel() const
 
     if (m_type == ElementType::TextLabel)
         return m_text;
+
+    if (!m_readout.isEmpty()) {                         // измерительные приборы показывают измеренное значение
+        switch (m_type) {
+        case ElementType::Voltmeter:
+        case ElementType::Ammeter:
+        case ElementType::Ohmmeter:
+        case ElementType::Probe:
+        case ElementType::TestPoint:
+            return m_readout;
+        default:
+            break;
+        }
+    }
 
     switch (m_type) {
     case ElementType::VariableResistor:
@@ -518,7 +681,7 @@ void CircuitItem::updateLabelRect()
         m_labelRect = QRectF();
         return;
     }
-    const QFontMetricsF fm(labelFont(isText() ? int(param(QStringLiteral("size"))) : 12));
+    const QFontMetricsF fm(labelFont(isText() ? int(param(QStringLiteral("size"))) : 12, !isText()));
     const qreal w = fm.horizontalAdvance(m_label) + 8.0;
     const qreal h = fm.height() + 2.0;
 
@@ -587,7 +750,16 @@ void CircuitItem::setElectrical(const QVector<double> &pinVoltages, double curre
     m_hasElectrical = true;
     m_pinV = pinVoltages;
     m_current = current;
+    if (m_type == ElementType::LED) {                    // зажигается по току: прямой ток / максимальный ток
+        const double maxI = std::max(1e-9, param(QStringLiteral("maxCurrent")));
+        m_light = { std::clamp(current / maxI, 0.0, 1.0) };
+    }
     update();
+    if (m_probe) {
+        const double v = pinVoltages.size() >= 2 ? pinVoltages[0] - pinVoltages[1]
+                                                 : pinVoltages.value(0);
+        m_probe->push(s_simTime, v, current);
+    }
 }
 
 void CircuitItem::clearElectrical()
@@ -597,6 +769,7 @@ void CircuitItem::clearElectrical()
     m_hasElectrical = false;
     m_pinV.clear();
     m_current = 0;
+    m_light.clear();
     update();
 }
 
@@ -615,6 +788,8 @@ void CircuitItem::notifyScene()
 {
     if (auto *s = qobject_cast<CircuitScene *>(scene()))
         s->invalidateConnectivity();
+    if (m_probe)
+        m_probe->targetMoved();          // линия связи осциллограммы на схеме следует за элементом
 }
 
 QVariant CircuitItem::itemChange(GraphicsItemChange change, const QVariant &value)
@@ -638,6 +813,8 @@ QRectF CircuitItem::boundingRect() const
         r = r.united(shape().boundingRect().adjusted(-6, -6, 6, 6));
     if (!m_labelRect.isNull())
         r = r.united(m_labelRect.adjusted(-2, -2, 2, 2));
+    if (isLightEmitter() && !isSinglePin())
+        r = r.adjusted(-34, -34, 34, 34);                // ореол свечения выходит за корпус
     return r;
 }
 
@@ -646,13 +823,21 @@ QPainterPath CircuitItem::shape() const
     if (!m_shapeDirty)
         return m_shapeCache;
 
-    QPainterPath axis;
-    axis.moveTo(m_p1);
-    axis.lineTo(m_p2);
-    QPainterPathStroker st;
-    st.setWidth(isWire() || m_type == ElementType::Line ? 12.0 : 22.0);
-    st.setCapStyle(Qt::RoundCap);
-    QPainterPath path = st.createStroke(axis);
+    // Фигура собирается через addPath с правилом WindingFill: это дёшево, в отличие от united() на каждый вывод
+    // (у модулей на 64 вывода пересборка при каждом шаге переноса давала заметные подвисания).
+    QPainterPath path;
+    path.setFillRule(Qt::WindingFill);
+    if (!isMultiPin()) {
+        // У многовыводных элементов ось не выступает за корпус: её «трубка» давала лишний хвост в ореоле выделения.
+        QPainterPath axis;
+        axis.moveTo(m_p1);
+        axis.lineTo(m_p2);
+        QPainterPathStroker st;
+        st.setWidth(isWire() || m_type == ElementType::Line ? 12.0 : 22.0);
+        st.setCapStyle(Qt::RoundCap);
+        path = st.createStroke(axis);
+        path.setFillRule(Qt::WindingFill);
+    }
 
     if (isBox()) {                                             // только контур рамки, середина прозрачна для кликов
         const QRectF r = QRectF(QPointF(m_p1), QPointF(m_p2)).normalized();
@@ -678,7 +863,7 @@ QPainterPath CircuitItem::shape() const
         QPainterPath bodyPath;
         bodyPath.addPolygon(body);
         bodyPath.closeSubpath();
-        path = path.united(bodyPath);
+        path.addPath(bodyPath);
 
         if (isMultiPin()) {                                   // выводы вне оси
             QPainterPathStroker ls;
@@ -690,7 +875,7 @@ QPainterPath CircuitItem::shape() const
                 QPainterPath lead;
                 lead.moveTo(toScene(l.x(), l.y()));
                 lead.lineTo(toScene(l.x() + in.x() * 18.0, l.y() + in.y() * 18.0));
-                path = path.united(ls.createStroke(lead));
+                path.addPath(ls.createStroke(lead));
             }
         }
     }
@@ -704,7 +889,7 @@ QPainterPath CircuitItem::shape() const
         dots.addEllipse(QPointF(m_p1), 7.0, 7.0);
         dots.addEllipse(QPointF(m_p2), 7.0, 7.0);
     }
-    path = path.united(dots);
+    path.addPath(dots);
 
     m_shapeCache = path;
     m_shapeDirty = false;
@@ -734,6 +919,38 @@ void CircuitItem::paint(QPainter *p, const QStyleOptionGraphicsItem *, QWidget *
         p->setPen(Qt::NoPen);
         p->setBrush(halo);
         p->drawPath(shape());
+    }
+
+    // --- проблема: красный ореол всего элемента -------------------------------
+    if (m_problemBody && !m_preview) {
+        QColor red = pal.negative;
+        red.setAlpha(80);
+        p->setPen(QPen(pal.negative, 1.5));
+        p->setBrush(red);
+        p->drawPath(shape());
+    }
+
+    // --- свечение индикатора: мягкий ореол цвета, который выбрал пользователь ---
+    if (!m_preview && !m_light.isEmpty() && m_type != ElementType::SegDisplay && m_type != ElementType::LedMatrix) {
+        const double lv = std::clamp(m_type == ElementType::LedRGB
+                                         ? std::max({ m_light.value(0), m_light.value(1), m_light.value(2) })
+                                         : m_light[0], 0.0, 1.0);
+        if (lv > 0.02) {
+            const QColor g = glowColor();
+            const QPointF center = isSinglePin() ? a + (b - a) * 0.8 : (a + b) / 2.0;
+            const qreal radius = isSinglePin() ? 22.0 : 32.0;
+            QRadialGradient grad(center, radius);
+            QColor c0 = g, c1 = g, c2 = g;
+            c0.setAlphaF(0.55 * lv);
+            c1.setAlphaF(0.22 * lv);
+            c2.setAlpha(0);
+            grad.setColorAt(0.0, c0);
+            grad.setColorAt(0.55, c1);
+            grad.setColorAt(1.0, c2);
+            p->setPen(Qt::NoPen);
+            p->setBrush(grad);
+            p->drawEllipse(center, radius, radius);
+        }
     }
 
     // --- цвета выводов по напряжению ------------------------------------
@@ -770,6 +987,17 @@ void CircuitItem::paint(QPainter *p, const QStyleOptionGraphicsItem *, QWidget *
         ctx.state = stateValue();
         ctx.width = w;
         ctx.body = pal.element;
+        if (isLightEmitter() || m_params.contains(QStringLiteral("glow"))) {
+            ctx.glow = glowColor();
+            ctx.light = m_light;
+        }
+        ctx.readout = m_readout;
+        if (isKarnaugh()) {
+            ctx.cells = m_cells;
+            ctx.result = m_formula;
+        }
+        if (m_type == ElementType::DecimalDisplay)
+            ctx.digits = int(param(QStringLiteral("digits")));
         for (int i = 0; i < SymbolPainter::kMaxPins; ++i)
             ctx.pin[i] = pinColor[i];
         SymbolPainter::paint(ctx);
@@ -789,6 +1017,16 @@ void CircuitItem::paint(QPainter *p, const QStyleOptionGraphicsItem *, QWidget *
         }
     }
     p->restore();
+
+    // --- проблема: красные кольца у выводов -------------------------------
+    if (m_problemMask != 0 && !m_preview) {
+        p->setBrush(Qt::NoBrush);
+        p->setPen(QPen(pal.negative, 2.2));
+        const QVector<QPoint> pts = connectionPoints();
+        for (int i = 0; i < pts.size() && i < SymbolPainter::kMaxPins; ++i)
+            if (m_problemMask & (quint64(1) << i))
+                p->drawEllipse(QPointF(pts[i]), 7.5, 7.5);
+    }
 
     // --- точки тока ------------------------------------------------------
     if (m_hasElectrical && len > 0.0 && lod > 0.3 && std::fabs(m_current) >= 1e-12
@@ -825,7 +1063,7 @@ void CircuitItem::paint(QPainter *p, const QStyleOptionGraphicsItem *, QWidget *
 
     // --- подпись ---------------------------------------------------------
     if (!m_label.isEmpty() && (isText() || (theme.showLabels() && lod > 0.45))) {
-        p->setFont(labelFont(isText() ? int(param(QStringLiteral("size"))) : 12));
+        p->setFont(labelFont(isText() ? int(param(QStringLiteral("size"))) : 12, !isText()));
         p->setPen(isSelected() ? pal.accent : pal.text);
         p->drawText(m_labelRect, Qt::AlignCenter, m_label);
     }

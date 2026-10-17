@@ -4,6 +4,8 @@
 #include <QLabel>
 #include <QPushButton>
 #include <QSettings>
+#include <QSignalBlocker>
+#include <QStyle>
 #include <QSlider>
 #include <QVBoxLayout>
 
@@ -33,12 +35,8 @@ SimulationPanel::SimulationPanel(QWidget *parent)
     const int power   = s.value("sim/power", 50).toInt();
 
     auto *root = new QVBoxLayout(this);
-    root->setContentsMargins(16, 14, 16, 14);
+    root->setContentsMargins(20, 18, 20, 18);
     root->setSpacing(10);
-
-    auto *title = new QLabel(QStringLiteral("СИМУЛЯЦИЯ"), this);
-    title->setObjectName(QStringLiteral("sectionTitle"));
-    root->addWidget(title);
 
     auto *reset = new QPushButton(QStringLiteral("Сброс"), this);
     m_run = new QPushButton(QStringLiteral("Старт"), this);
@@ -48,6 +46,12 @@ SimulationPanel::SimulationPanel(QWidget *parent)
     buttons->addWidget(reset, 1);
     buttons->addWidget(m_run, 1);
     root->addLayout(buttons);
+
+    m_status = new QLabel(this);
+    m_status->setObjectName(QStringLiteral("simStatus"));
+    m_status->setWordWrap(true);
+    root->addWidget(m_status);
+    setStatus(State::Idle, QStringLiteral("Готова к запуску"));
 
     m_speed   = addSlider(root, QStringLiteral("Скорость симуляции"), &m_speedValue, speed);
     m_current = addSlider(root, QStringLiteral("Скорость тока"),      &m_currentValue, current);
@@ -64,6 +68,8 @@ SimulationPanel::SimulationPanel(QWidget *parent)
     connect(reset, &QPushButton::clicked, this, &SimulationPanel::resetClicked);
     connect(m_run, &QPushButton::toggled, this, [this](bool on) {
         m_run->setText(on ? QStringLiteral("Стоп") : QStringLiteral("Старт"));
+        setStatus(on ? State::Running : State::Idle,
+                  on ? QStringLiteral("Работает") : QStringLiteral("Остановлена"));
         emit runningChanged(on);
     });
     connect(m_speed, &QSlider::valueChanged, this, [this](int) {
@@ -81,6 +87,25 @@ SimulationPanel::SimulationPanel(QWidget *parent)
         QSettings().setValue("sim/power", m_power->value());
         emit powerBrightnessChanged(powerBrightness());
     });
+}
+
+void SimulationPanel::setStatus(State state, const QString &text)
+{
+    const char *name = state == State::Running ? "running" : state == State::Error ? "error" : "idle";
+    m_status->setProperty("state", QString::fromLatin1(name));
+    m_status->setText(QStringLiteral("● ") + text);
+    m_status->style()->unpolish(m_status);                 // перечитать цвет по свойству state
+    m_status->style()->polish(m_status);
+}
+
+void SimulationPanel::setStopped(const QString &reason)
+{
+    {
+        const QSignalBlocker block(m_run);
+        m_run->setChecked(false);
+        m_run->setText(QStringLiteral("Старт"));
+    }
+    setStatus(State::Error, QStringLiteral("Остановлена: ") + reason);
 }
 
 QSlider *SimulationPanel::addSlider(QVBoxLayout *lay, const QString &title, QLabel **valueLabel, int value)

@@ -1,5 +1,8 @@
 #include "canvas/CircuitView.h"
 
+#include "scope/ScopeItem.h"
+#include "sim/IssueBanner.h"
+
 #include <QContextMenuEvent>
 #include <QCursor>
 #include <QKeyEvent>
@@ -34,11 +37,15 @@ CircuitView::CircuitView(QWidget *parent)
 {
     m_scene = new CircuitScene(this);
     setScene(m_scene);
+    m_banner = new IssueBanner(this);
+    connect(m_banner, &IssueBanner::showClicked, this, &CircuitView::bannerShowRequested);
+    connect(m_banner, &IssueBanner::closeClicked, this, &CircuitView::hideStopBanner);
     m_undo = new QUndoStack(this);
 
     setRenderHint(QPainter::Antialiasing, true);
     setRenderHint(QPainter::TextAntialiasing, true);
     setFrameShape(QFrame::NoFrame);
+    setAcceptDrops(false);              // перетаскиваемую вкладку принимает область вкладок, а не холст
     setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     setTransformationAnchor(QGraphicsView::NoAnchor);
@@ -152,8 +159,129 @@ void CircuitView::selectAll()
             ci->setSelected(true);
 }
 
+CircuitItem *CircuitView::itemByUid(quint64 uid) const
+{
+    if (!uid)
+        return nullptr;
+    for (CircuitItem *it : m_scene->circuitItems())
+        if (it->uid() == uid)
+            return it;
+    return nullptr;
+}
+
+void CircuitView::focusItem(quint64 uid, const QVector<int> &)
+{
+    CircuitItem *it = itemByUid(uid);
+    if (!it)
+        return;
+    m_scene->clearSelection();
+    it->setSelected(true);
+    centerOn(QPointF(it->p1() + it->p2()) / 2.0);
+}
+
+void CircuitView::markProblems(const QVector<SimIssue> &issues)
+{
+    clearProblems();
+    for (const SimIssue &issue : issues) {
+        CircuitItem *it = itemByUid(issue.itemUid);
+        if (!it)
+            continue;
+        quint64 mask = 0;
+        for (int pin : issue.pins)
+            if (pin >= 0 && pin < 64)
+                mask |= quint64(1) << pin;
+        it->setProblem(mask, issue.pins.isEmpty());
+    }
+}
+
+void CircuitView::clearProblems()
+{
+    for (CircuitItem *it : m_scene->circuitItems())
+        if (it->hasProblem())
+            it->clearProblem();
+}
+
+void CircuitView::showStopBanner(const QString &title, const QString &message)
+{
+    m_banner->setContent(title, message);
+    m_banner->show();
+    layoutBanner();
+    m_banner->raise();
+}
+
+void CircuitView::hideStopBanner()
+{
+    m_banner->hide();
+}
+
+void CircuitView::layoutBanner()
+{
+    if (!m_banner || !m_banner->isVisible())
+        return;
+    const int w = std::max(240, std::min(width() - 32, 780));
+    m_banner->setFixedWidth(w);
+    m_banner->adjustSize();
+    m_banner->move((width() - w) / 2, 14);
+}
+
+void CircuitView::resizeEvent(QResizeEvent *e)
+{
+    QGraphicsView::resizeEvent(e);
+    layoutBanner();
+}
+
+ScopeItem *CircuitView::scopeAt(const QPointF &scenePos) const
+{
+    for (QGraphicsItem *gi : m_scene->items(scenePos, Qt::IntersectsItemShape, Qt::DescendingOrder))
+        if (gi->type() == ScopeItem::Type)
+            return static_cast<ScopeItem *>(gi);
+    return nullptr;
+}
+
+ScopeItem *CircuitView::addScope(CircuitItem *target)
+{
+    if (!target)
+        return nullptr;
+    ScopeSource *src = target->probe(true);
+    if (!src)
+        return nullptr;
+
+    // Ставим справа-сверху от элемента; каждая следующая осциллограмма того же элемента — чуть ниже.
+    int sameTarget = 0;
+    for (QGraphicsItem *gi : m_scene->items())
+        if (gi->type() == ScopeItem::Type && static_cast<ScopeItem *>(gi)->source() == src)
+            ++sameTarget;
+    const QPointF center = QPointF(target->p1() + target->p2()) / 2.0;
+    const QPoint pos = CircuitScene::snap(center + QPointF(48, -ScopeItem::kHeight - 32 + sameTarget * 32));
+
+    auto *item = new ScopeItem(src);
+    item->setPos(pos);
+    m_scene->addItem(item);
+    m_scene->clearSelection();
+    item->setSelected(true);
+    return item;
+}
+
+void CircuitView::removeScope(ScopeItem *item)
+{
+    if (!item)
+        return;
+    if (m_scopeDrag == item)
+        m_scopeDrag = nullptr;
+    m_scene->removeItem(item);
+    delete item;
+}
+
 void CircuitView::deleteSelected()
 {
+    // Осциллограммы на схеме удаляются сразу (в историю отмены они не входят).
+    const QList<QGraphicsItem *> selected = m_scene->selectedItems();
+    for (QGraphicsItem *gi : selected) {
+        if (gi->type() == ScopeItem::Type) {
+            m_scene->removeItem(gi);
+            delete gi;
+        }
+    }
     const QList<CircuitItem *> sel = selectedCircuitItems();
     if (sel.isEmpty())
         return;
@@ -162,6 +290,12 @@ void CircuitView::deleteSelected()
 
 void CircuitView::clearAll()
 {
+    for (QGraphicsItem *gi : m_scene->items()) {
+        if (gi->type() == ScopeItem::Type) {
+            m_scene->removeItem(gi);
+            delete gi;
+        }
+    }
     QList<CircuitItem *> all;
     for (CircuitItem *ci : m_scene->circuitItems())
         if (!ci->isPreview())
@@ -186,6 +320,8 @@ QVector<ItemData> CircuitView::snapshot(bool selectedOnly) const
         d.flip = it->flipped();
         d.params = it->params();
         d.text = it->text();
+        if (it->isKarnaugh())
+            d.cells = it->cells();
         out.append(d);
     }
     return out;
@@ -200,6 +336,8 @@ QList<CircuitItem *> CircuitView::addItems(const QVector<ItemData> &data, const 
         auto *it = new CircuitItem(d.type);
         it->setParams(d.params);
         it->setText(d.text);
+        if (!d.cells.isEmpty())
+            it->setCells(d.cells);
         it->setGeometry(d.a + offset, d.b + offset, d.flip);
         created.append(it);
     }
@@ -305,6 +443,18 @@ void CircuitView::setItemParams(CircuitItem *item, const QMap<QString, double> &
 
 void CircuitView::toggleDipSwitch(CircuitItem *item, int position)
 {
+    if (item && item->isKarnaugh()) {                        // клик по клетке карты: 0 → 1 → X → 0
+        const int cols = std::clamp(int(std::lround(item->param(QStringLiteral("width")))), 1, CircuitItem::kKarnaughStride);
+        if (position < 1)
+            return;
+        const int idx = ((position - 1) / cols) * CircuitItem::kKarnaughStride + (position - 1) % cols;
+        QVector<quint8> cells = item->cells();
+        if (idx < 0 || idx >= cells.size())
+            return;
+        cells[idx] = quint8((cells[idx] + 1) % 3);
+        m_undo->push(new ChangeCellsCommand(item, item->cells(), cells));
+        return;
+    }
     if (!item || position < 1 || position > 32)
         return;
     const double old = item->param(QStringLiteral("mask"));
@@ -925,6 +1075,26 @@ void CircuitView::mousePressEvent(QMouseEvent *e)
     const bool shift = mods & Qt::ShiftModifier;
     const bool alt   = mods & Qt::AltModifier;
 
+    // Окошко осциллограммы: «×» удаляет, иначе — выделить и тащить.
+    if (ScopeItem *scope = scopeAt(sp)) {
+        if (scope->closeHit(scope->mapFromScene(sp))) {
+            m_scene->removeItem(scope);
+            delete scope;
+        } else if (scope->gearHit(scope->mapFromScene(sp))) {
+            m_scene->clearSelection();
+            scope->setSelected(true);
+            emit scopeActivated(scope);                      // параметры осциллографа
+        } else {
+            if (!ctrl)
+                m_scene->clearSelection();
+            scope->setSelected(true);
+            m_scopeDrag = scope;
+            m_scopeOffset = scope->pos() - sp;
+        }
+        e->accept();
+        return;
+    }
+
     int ep = -1;
     CircuitItem *it = hitItem(sp, &ep);
 
@@ -943,7 +1113,8 @@ void CircuitView::mousePressEvent(QMouseEvent *e)
     } else if (ep >= 0) {
         beginEndpointDrag(it, ep);                           // вывод: перенос узла / поворот земли
     } else {
-        if (!it->isSelected()) {
+        const bool wasSelected = it->isSelected();
+        if (!wasSelected) {
             m_scene->clearSelection();
             it->setSelected(true);
         }
@@ -957,9 +1128,9 @@ void CircuitView::mousePressEvent(QMouseEvent *e)
                 if (it->elementType() == ElementType::Keypad) {
                     m_heldKeypad = it;                       // клавиша нажата, пока держим кнопку мыши
                     it->setParam(QStringLiteral("key"), part);
-                } else {
+                } else if (!it->isKarnaugh() || wasSelected) {
                     m_clickDip = it;                         // переключатель меняется щелчком без сдвига
-                    m_clickDipPart = part;
+                    m_clickDipPart = part;                   // (клетка карты — только у выделенной карты: первый щелчок лишь выделяет)
                 }
             }
         }
@@ -971,6 +1142,12 @@ void CircuitView::mouseMoveEvent(QMouseEvent *e)
 {
     const QPointF sp = mapToScene(e->position().toPoint());
     const QPoint snapped = CircuitScene::snap(sp);
+
+    if (m_scopeDrag && (e->buttons() & Qt::LeftButton)) {
+        m_scopeDrag->setPos(CircuitScene::snap(sp + m_scopeOffset));
+        e->accept();
+        return;
+    }
 
     const QPoint grid(snapped.x() / CircuitScene::kGrid, snapped.y() / CircuitScene::kGrid);
     if (grid != m_cursorGrid) {
@@ -1022,6 +1199,12 @@ void CircuitView::mouseReleaseEvent(QMouseEvent *e)
         return;
     }
 
+    if (m_scopeDrag) {
+        m_scopeDrag = nullptr;
+        e->accept();
+        return;
+    }
+
     CircuitItem *toggle = m_clickToggle;
     m_clickToggle = nullptr;
     releaseHeldKey();
@@ -1052,6 +1235,14 @@ void CircuitView::mouseReleaseEvent(QMouseEvent *e)
 
 void CircuitView::mouseDoubleClickEvent(QMouseEvent *e)
 {
+    if (e->button() == Qt::LeftButton && m_selectMode) {
+        if (ScopeItem *scope = scopeAt(mapToScene(e->position().toPoint()))) {
+            m_scopeDrag = nullptr;
+            emit scopeActivated(scope);
+            e->accept();
+            return;
+        }
+    }
     if (e->button() == Qt::LeftButton && m_selectMode) {
         if (CircuitItem *it = hitItem(mapToScene(e->position().toPoint()), nullptr)) {
             cancelOperation();           // первый клик двойного клика мог начать перенос
@@ -1092,6 +1283,16 @@ void CircuitView::keyPressEvent(QKeyEvent *e)
 
 void CircuitView::contextMenuEvent(QContextMenuEvent *e)
 {
+    if (m_selectMode && m_drag == Drag::None) {
+        if (ScopeItem *scope = scopeAt(mapToScene(e->pos()))) {
+            m_contextItem = nullptr;
+            m_scene->clearSelection();
+            scope->setSelected(true);
+            emit scopeMenuRequested(scope, e->globalPos());
+            e->accept();
+            return;
+        }
+    }
     if (m_selectMode && m_drag == Drag::None) {
         CircuitItem *it = hitItem(mapToScene(e->pos()), nullptr);
         m_contextItem = it;

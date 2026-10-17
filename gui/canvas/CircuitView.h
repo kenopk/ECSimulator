@@ -11,10 +11,13 @@
 #include <QVector>
 #include <climits>
 
+#include "sim/SimIssue.h"
 #include "util/CoreTypes.h"
 
 class CircuitItem;
 class CircuitScene;
+class ScopeItem;
+class IssueBanner;
 class QRubberBand;
 class QUndoStack;
 
@@ -25,6 +28,7 @@ struct ItemData {
     bool flip = false;
     QMap<QString, double> params;
     QString text;                     // текст надписи
+    QVector<quint8> cells;            // клетки карты Карно (пусто у остальных элементов)
 };
 
 // Редактор схемы: выбор, рисование проводов и элементов, перенос, поворот,
@@ -81,6 +85,18 @@ public:
     QVector<ItemData> snapshot(bool selectedOnly) const;
     void loadSnapshot(const QVector<ItemData> &data, const QString &undoText);
 
+    // Осциллограмма элемента прямо на схеме (окошко с графиком и линией к элементу).
+    ScopeItem *addScope(CircuitItem *target);
+    void removeScope(ScopeItem *item);
+
+    // --- остановка симуляции: красная подсветка виновников и плашка с причиной -------------------
+    CircuitItem *itemByUid(quint64 uid) const;
+    void focusItem(quint64 uid, const QVector<int> &pins = {});      // выделить элемент и показать его
+    void markProblems(const QVector<SimIssue> &issues);              // подсветить виновников красным
+    void clearProblems();
+    void showStopBanner(const QString &title, const QString &message);
+    void hideStopBanner();
+
     // --- вид -------------------------------------------------------------
     qreal zoom() const;
     void zoomIn();
@@ -99,9 +115,13 @@ signals:
     void zoomChanged(qreal zoom);
     void itemActivated(CircuitItem *item);            // двойной клик
     void contextMenuRequested(const QPoint &globalPos);
+    void bannerShowRequested();                                     // «Показать» на плашке остановки
+    void scopeActivated(ScopeItem *scope);                          // клик по шестерёнке / двойной клик: параметры
+    void scopeMenuRequested(ScopeItem *scope, const QPoint &globalPos);   // ПКМ по осциллограмме
 
 protected:
     void wheelEvent(QWheelEvent *e) override;
+    void resizeEvent(QResizeEvent *e) override;
     void mousePressEvent(QMouseEvent *e) override;
     void mouseMoveEvent(QMouseEvent *e) override;
     void mouseReleaseEvent(QMouseEvent *e) override;
@@ -161,6 +181,11 @@ private:
     bool m_routedWire = false;
     CircuitItem *m_clickToggle = nullptr;   // ключ/кнопка под нажатой ЛКМ: щелчок без сдвига переключает
     CircuitItem *m_contextItem = nullptr;
+    IssueBanner *m_banner = nullptr;
+    void layoutBanner();
+    ScopeItem *m_scopeDrag = nullptr;        // осциллограмма, которую сейчас тащат мышью
+    QPointF m_scopeOffset;
+    ScopeItem *scopeAt(const QPointF &scenePos) const;
     CircuitItem *m_heldKeypad = nullptr;    // клавиатура с удерживаемой клавишей
     CircuitItem *m_clickDip = nullptr;      // DIP-переключатель: щелчок без сдвига переключает позицию m_clickDipPart
     int m_clickDipPart = 0;

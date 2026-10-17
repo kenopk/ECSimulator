@@ -1,7 +1,11 @@
 #include "widgets/ParamForm.h"
 
 #include <QAbstractItemView>
+#include <QColorDialog>
 #include <QComboBox>
+#include <QPushButton>
+#include <QEvent>
+#include <QWheelEvent>
 #include <QGridLayout>
 #include <QLabel>
 #include <QLineEdit>
@@ -13,6 +17,7 @@
 #include <algorithm>
 #include <cmath>
 
+#include "items/CircuitItem.h"
 #include "util/Units.h"
 
 namespace {
@@ -119,10 +124,26 @@ double clean(double v)                     // убираем хвосты вид
 }
 
 // Список единиц: в закрытом виде показывает коротко («kΩ»), в раскрытом — с переводом.
-class UnitCombo : public QComboBox
+// Список, который меняется колесом только когда выбран (в фокусе): иначе колесо должно прокручивать панель.
+class FocusCombo : public QComboBox
 {
 public:
-    using QComboBox::QComboBox;
+    explicit FocusCombo(QWidget *parent = nullptr) : QComboBox(parent) { setFocusPolicy(Qt::StrongFocus); }
+
+protected:
+    void wheelEvent(QWheelEvent *e) override
+    {
+        if (hasFocus())
+            QComboBox::wheelEvent(e);
+        else
+            e->ignore();
+    }
+};
+
+class UnitCombo : public FocusCombo
+{
+public:
+    using FocusCombo::FocusCombo;
 
 protected:
     void paintEvent(QPaintEvent *) override
@@ -183,8 +204,26 @@ ParamForm::ParamForm(ElementType type, const QMap<QString, double> &values, QWid
         grid->addWidget(label, row, 0);
 
         const int index = m_fields.size();
-        if (pd.choices) {
-            f.combo = new QComboBox(this);
+        if (pd.color) {
+            f.colorButton = new QPushButton(this);
+            f.colorButton->setCursor(Qt::PointingHandCursor);
+            f.colorButton->setToolTip(QStringLiteral("Нажмите, чтобы выбрать цвет"));
+            grid->addWidget(f.colorButton, row, 1, 1, 2);
+            connect(f.colorButton, &QPushButton::clicked, this, [this, index] {
+                Field &fld = m_fields[index];
+                const QColor now = QColor::fromRgb(quint32(std::max(0.0, fld.value)));
+                const QColor picked = QColorDialog::getColor(now, this, QStringLiteral("Цвет свечения"));
+                if (!picked.isValid())
+                    return;
+                const double v = double(picked.rgb() & 0xFFFFFF);
+                if (v != fld.value) {
+                    fld.value = v;
+                    showValue(fld, false);
+                    emit valueEdited(fld.key, v);
+                }
+            });
+        } else if (pd.choices) {
+            f.combo = new FocusCombo(this);
             f.combo->addItems(QString::fromUtf8(pd.choices).split(QLatin1Char('|')));
             f.combo->setCurrentIndex(std::clamp(int(f.value), 0, std::max(0, f.combo->count() - 1)));
             grid->addWidget(f.combo, row, 1, 1, 2);
@@ -198,6 +237,7 @@ ParamForm::ParamForm(ElementType type, const QMap<QString, double> &values, QWid
         } else {
             f.edit = new QLineEdit(this);
             f.edit->setToolTip(QString::fromUtf8(pd.label));
+            f.edit->installEventFilter(this);
             grid->addWidget(f.edit, row, 1);
             connect(f.edit, &QLineEdit::editingFinished, this, [this, index] { commit(index); });
 
@@ -237,7 +277,7 @@ ParamForm::ParamForm(ElementType type, const QMap<QString, double> &values, QWid
             }
         }
         m_fields.append(f);
-        if (m_fields.last().edit)
+        if (m_fields.last().edit || m_fields.last().colorButton)
             showValue(m_fields.last(), true);
         ++row;
     }
@@ -248,6 +288,16 @@ void ParamForm::showValue(Field &f, bool autoUnit)
     if (f.combo) {
         const QSignalBlocker block(f.combo);
         f.combo->setCurrentIndex(std::clamp(int(f.value), 0, std::max(0, f.combo->count() - 1)));
+        return;
+    }
+    if (f.colorButton) {                                    // образец цвета и код на самой кнопке
+        const QColor c = QColor::fromRgb(quint32(std::max(0.0, f.value)));
+        const QColor text = (c.redF() * 0.299 + c.greenF() * 0.587 + c.blueF() * 0.114) > 0.55 ? QColor("#111111") : QColor("#f4f4f4");
+        f.colorButton->setText(c.name().toUpper());
+        f.colorButton->setStyleSheet(QStringLiteral("QPushButton { background: %1; color: %2; border: 1px solid rgba(255,255,255,40);"
+                                                    " border-radius: 4px; padding: 6px 14px; font-family: Consolas, monospace; }"
+                                                    "QPushButton:hover { border-color: rgba(255,255,255,140); }")
+                                         .arg(c.name(), text.name()));
         return;
     }
     if (!f.edit)
@@ -301,6 +351,43 @@ void ParamForm::commit(int index)
     showValue(f, !plain);
 }
 
+bool ParamForm::eventFilter(QObject *obj, QEvent *ev)
+{
+    if (ev->type() == QEvent::Wheel) {
+        for (int i = 0; i < m_fields.size(); ++i) {
+            if (m_fields[i].edit != obj)
+                continue;
+            if (!m_fields[i].edit->hasFocus())
+                return false;                              // поле не выбрано: колесо прокручивает панель
+            auto *we = static_cast<QWheelEvent *>(ev);
+            const int dy = we->angleDelta().y();
+            if (dy == 0)
+                return false;
+            const int notches = std::max(1, std::abs(dy) / 120);
+            stepField(i, dy > 0 ? notches : -notches);
+            return true;
+        }
+    }
+    return QWidget::eventFilter(obj, ev);
+}
+
+void ParamForm::stepField(int index, int dir)
+{
+    if (index < 0 || index >= m_fields.size())
+        return;
+    commit(index);                                         // сначала принять недописанный ввод
+    Field &f = m_fields[index];
+    if (!f.edit)
+        return;
+    const double v = CircuitItem::stepValue(f.unit, f.minValue, f.maxValue, f.integer, f.value, dir);
+    if (v == f.value)
+        return;
+    f.value = v;
+    emit valueEdited(f.key, v);
+    showValue(f, true);                                    // единица подберётся по новому значению
+    f.edit->selectAll();
+}
+
 void ParamForm::commitPending()
 {
     for (int i = 0; i < m_fields.size(); ++i)
@@ -347,6 +434,10 @@ void ParamForm::focusFirst()
         }
         if (f.combo) {
             f.combo->setFocus();
+            return;
+        }
+        if (f.colorButton) {
+            f.colorButton->setFocus();
             return;
         }
     }

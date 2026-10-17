@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QColor>
+#include <QFont>
 #include <QObject>
 #include <QString>
 #include <QStringList>
@@ -12,6 +13,7 @@ struct Palette {
     QColor wire, element, junction, openPin;
     QColor nearMiss;                       // ярко-красный: слишком близкие, но не соединённые концы
     QColor accent, onAccent;               // onAccent — цвет текста/галочки поверх акцента
+    QColor focus;                          // рамка поля ввода в фокусе («лучевой» зелёный в Лаборатории)
     QColor positive, negative, current;
     // интерфейс
     QColor panel, panelAlt, border;
@@ -25,6 +27,14 @@ class Theme : public QObject
     Q_OBJECT
 public:
     static Theme &instance();
+
+    // Шрифты: интерфейс — Geist / Inter (если не установлены, Segoe UI), номиналы, логи и графики — JetBrains Mono
+    // (запасные: Cascadia Mono, Consolas). Файлы .ttf/.otf, положенные в папку «fonts» рядом с программой, подключаются сами.
+    static QStringList uiFamilies();
+    static QStringList monoFamilies();
+    static QFont uiFont(int pixelSize);
+    static QFont monoFont(int pixelSize);
+    static void loadBundledFonts();
 
     const Palette &palette() const { return m_palette; }
 

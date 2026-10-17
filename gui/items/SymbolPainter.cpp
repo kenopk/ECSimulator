@@ -1,4 +1,6 @@
 #include "items/SymbolPainter.h"
+#include "tools/KarnaughSolver.h"
+#include "theme/Theme.h"
 
 #include <QFont>
 #include <QFontMetricsF>
@@ -96,13 +98,32 @@ int gateInputs(unsigned variant)
     return variant ? std::clamp(int(variant), 2, 63) : 2;
 }
 
-// Вентиль с n входами: входы через 2 клетки, выход посередине.
+// Положение i-го входа вентиля с n входами, в клетках от оси. До 6 входов — через 2 клетки; больше — через клетку,
+// иначе вентиль на 12-63 входа вытягивается в огромную колонну.
+qreal gatePinV(int n, int i)
+{
+    if (n <= 6)
+        return -(n - 1) + 2.0 * i;
+    if (n % 2 == 1)
+        return i - (n - 1) / 2.0;                       // нечётное число: средний вход на оси, выход напротив
+    return i - n / 2 + (i >= n / 2 ? 1 : 0);           // чётное: между половинами пропуск под выход
+}
+
+qreal gateHalfSpan(int n)
+{
+    qreal m = 0;
+    for (int i = 0; i < n; ++i)
+        m = std::max(m, std::fabs(gatePinV(n, i)));
+    return m;
+}
+
+// Вентиль с n входами, выход посередине.
 Spec gateSpec(unsigned variant)
 {
     const int n = gateInputs(variant);
-    Spec s = makeSpec(40, 4, n + 1, true, 1, (n - 1) * 16.0 + 10.0);
+    Spec s = makeSpec(40, 4, n + 1, true, 1, gateHalfSpan(n) * 16.0 + 10.0);
     for (int i = 0; i < n; ++i)
-        setPin(s, i, 0, -(n - 1) + 2.0 * i);
+        setPin(s, i, 0, gatePinV(n, i));
     setPin(s, n, 1, 0);
     return s;
 }
@@ -192,7 +213,8 @@ void text(const Ctx &c, const P &pos, const QString &s, qreal px, bool bold = tr
     p->translate(pos);
     p->scale(1.0, c.flip ? -1.0 : 1.0);
     p->rotate(-c.angle);
-    QFont f(QStringLiteral("Segoe UI"));
+    QFont f;
+    f.setFamilies(Theme::uiFamilies());
     f.setPixelSize(std::max(1, int(px * c.textScale)));
     f.setBold(bold);
     p->setFont(f);
@@ -644,10 +666,10 @@ void paintGate(const Ctx &c, const QString &sym, bool inverted, int inputs = 2)
     const qreal extra = inverted ? 7.0 : 0.0;
     const qreal x0 = cx - (40.0 + extra) / 2.0;
     const qreal x1 = x0 + 40.0;
-    const qreal h = (inputs - 1) * 16.0 + 8.0;
+    const qreal h = gateHalfSpan(inputs) * 16.0 + 8.0;
 
     for (int i = 0; i < inputs; ++i) {
-        const qreal y = (-(inputs - 1) + 2.0 * i) * kGrid;
+        const qreal y = gatePinV(inputs, i) * kGrid;
         lead(c, i, P(0, y), P(x0, y));
     }
     lead(c, inputs, P(L, 0), P(x1 + extra, 0));
@@ -784,7 +806,15 @@ Spec spec(ElementType t, unsigned variant)
     case T::Speaker:
     case T::Microphone:        return twoPin(24, 3, 14);
     case T::Scope:             return twoPin(32, 3, 18);
-    case T::DecimalDisplay:    return twoPin(36, 3, 12);
+    case T::DecimalDisplay:    return twoPin(84, 8, 22);
+    case T::LedRGB: {
+        Spec s = makeSpec(30, 5, 4, true, 1, 22);          // R, G, B слева, общий катод справа
+        setPin(s, 0, 0, -1);
+        setPin(s, 1, 0, 0);
+        setPin(s, 2, 0, 1);
+        setPin(s, 3, 1, 0);
+        return s;
+    }
     case T::AutoTransformer: {
         Spec s = makeSpec(24, 4, 3, true, 1, 34);
         setPin(s, 0, 0, -2);
@@ -1108,6 +1138,7 @@ void paint(const PaintContext &c)
     case T::Motor:             paintMeter(c, QStringLiteral("M")); break;
     case T::Scope:             paintScope(c); break;
     case T::DecimalDisplay:    paintDecimalDisplay(c); break;
+    case T::LedRGB:            paintLedRgb(c); break;
 
     case T::Crystal:           paintCrystal(c); break;
     case T::NeonLamp:          paintNeonLamp(c); break;

@@ -253,6 +253,7 @@ enum class ElementType : int {
     LCD,
     Keypad,
     DipSwitch,
+    KarnaughMap,
 
     Count_
 };
@@ -269,11 +270,12 @@ struct ParamDef {
     double maxValue;
     const char* choices = nullptr;
     bool integer = false;                  // целое число: поле округляется
+    bool color = false;                    // цвет: значение — RGB как целое 0xRRGGBB, в форме — кнопка выбора цвета
 };
 
 // Элементы, у которых число выводов зависит от параметров (вентили — число входов,
 // память — объём, матрицы — размер, индикатор — тип). См. variantOf()/layoutFor().
-enum class Dynamic : int { None = 0, GateInputs, Memory, DiodeMatrix, SegDisplay, LedMatrix, Bits, Keypad, Lcd, Dip };
+enum class Dynamic : int { None = 0, GateInputs, Memory, DiodeMatrix, SegDisplay, LedMatrix, Bits, Keypad, Lcd, Dip, Karnaugh };
 
 struct ElementInfo {
     ElementType type;
@@ -403,11 +405,13 @@ inline unsigned variantOf(const ElementInfo& info, const ParamGetter& get)
         return static_cast<unsigned>(clampInt(get("inputs"), 1, 16))
              | static_cast<unsigned>(clampInt(get("outputs"), 1, 16)) << 8
              | static_cast<unsigned>(clampInt(get("preset"), 0, 3)) << 16;
-    case Dynamic::SegDisplay:
-        return static_cast<unsigned>(clampInt(get("segments"), 0, 3)) + 1;
-    case Dynamic::LedMatrix:      // строк | столбцов << 8
+    case Dynamic::SegDisplay:     // тип (сегментов + 1) | число разрядов << 8
+        return (static_cast<unsigned>(clampInt(get("segments"), 0, 5)) + 1)
+             | static_cast<unsigned>(clampInt(get("digits"), 1, 16)) << 8;
+    case Dynamic::LedMatrix:      // строк | столбцов << 8 | «по порядку» << 16 (иначе — как у реальной матрицы 8×8)
         return static_cast<unsigned>(clampInt(get("rows"), 1, 32))
-             | static_cast<unsigned>(clampInt(get("cols"), 1, 32)) << 8;
+             | static_cast<unsigned>(clampInt(get("cols"), 1, 32)) << 8
+             | (get("pinout") > 0.5 ? 1u << 16 : 0u);
     case Dynamic::Bits: {         // разрядность (или число адресных/входных линий) — параметр "bits"
         int lo = 1, hi = 32;
         for (const ParamDef& pd : info.params)
@@ -424,6 +428,10 @@ inline unsigned variantOf(const ElementInfo& info, const ParamGetter& get)
         return static_cast<unsigned>(clampInt(get("size"), 0, 7)) + 1;
     case Dynamic::Dip:            // число позиций
         return static_cast<unsigned>(clampInt(get("positions"), 1, 32));
+    case Dynamic::Karnaugh:       // столбцов | строк << 8 | «без выводов» << 16
+        return static_cast<unsigned>(clampInt(get("width"), 1, 16))
+             | static_cast<unsigned>(clampInt(get("height"), 1, 16)) << 8
+             | (get("pins") > 0.5 ? 1u << 16 : 0u);
     default:
         return 0;
     }
@@ -535,27 +543,82 @@ inline ChipLayout layoutFor(const ElementInfo& info, unsigned variant)
         break;
     case Dynamic::LedMatrix:
         if (variant) {
-            out.title = "@ledm";            // строки — слева, столбцы — сверху
-            seq(true, "R", static_cast<int>(variant & 0xFF));
-            for (int i = 0; i < static_cast<int>((variant >> 8) & 0xFF); ++i)
-                addE(2, "C" + std::to_string(i));
+            out.title = "@ledm";
+            const int rows = static_cast<int>(variant & 0xFF), cols = static_cast<int>((variant >> 8) & 0xFF);
+            const bool ordered = ((variant >> 16) & 1u) != 0;
+            if (rows == 8 && cols == 8 && !ordered) {
+                // Как у реальной матрицы 8×8 (16 выводов), вид сверху: выводы 16…9 слева направо — сверху,
+                // 1…8 слева направо — снизу. Названия: R — строка, C — столбец.
+                static const char* const top[] = { "C8", "C7", "R2", "C1", "R4", "C6", "C4", "R1" };
+                static const char* const bottom[] = { "R5", "R7", "C2", "C3", "R8", "C5", "R6", "R3" };
+                for (const char* n : top)
+                    addE(2, n);
+                for (const char* n : bottom)
+                    addE(3, n);
+            } else {                                   // по порядку: столбцы сверху, строки снизу
+                for (int i = 0; i < cols; ++i)
+                    addE(2, "C" + std::to_string(i + 1));
+                for (int i = 0; i < rows; ++i)
+                    addE(3, "R" + std::to_string(i + 1));
+            }
             return out;
         }
         break;
     case Dynamic::SegDisplay:
         if (variant) {
-            static const char* const k7[]  = { "a", "b", "c", "d", "e", "f", "g" };
+            // Выводы идут по двум длинным сторонам корпуса, как ножки реального индикатора.
+            // Несколько разрядов — общие сегментные выводы и по одному общему выводу D1…Dn на разряд.
+            // Виды (variant & 0xFF): 1 — 3 сегмента (цифра «1» и знак «−»), 2 — 5, 3 — 7, 4 — 9 (семь и две диагонали),
+            // 5 — 14 («звезда»), 6 — 16 сегментов.
             static const char* const k14[] = { "a", "b", "c", "d", "e", "f", "g1", "g2", "h", "j", "k", "l", "m", "n" };
             static const char* const k16[] = { "a1", "a2", "b", "c", "d1", "d2", "e", "f", "g1", "g2",
                                                "h", "i", "j", "k", "l", "m" };
-            switch (variant) {
-            case 2:  out.title = "@seg14"; for (const char* n : k14) add(true, n); break;
-            case 3:  out.title = "@seg16"; for (const char* n : k16) add(true, n); break;
-            case 4:  out.title = "@seg21"; for (int i = 1; i <= 21; ++i) add(true, "S" + std::to_string(i)); break;
-            default: out.title = "@seg7";  for (const char* n : k7) add(true, n); break;
+            static const char* const k9[]  = { "a", "b", "c", "d", "e", "f", "g", "h", "i" };
+            static const char* const k5[]  = { "a", "b", "c", "d", "g" };
+            static const char* const k3[]  = { "b", "c", "g" };
+            const unsigned kind = variant & 0xFF;
+            const int digits = std::max(1, static_cast<int>((variant >> 8) & 0xFF));
+            std::vector<std::string> names;
+            bool withDp = true;
+            switch (kind) {
+            case 1:  out.title = "@seg3";  names.assign(std::begin(k3), std::end(k3)); withDp = false; break;
+            case 2:  out.title = "@seg5";  names.assign(std::begin(k5), std::end(k5)); break;
+            case 4:  out.title = "@seg9";  names.assign(std::begin(k9), std::end(k9)); break;
+            case 5:  out.title = "@seg14"; names.assign(std::begin(k14), std::end(k14)); break;
+            case 6:  out.title = "@seg16"; names.assign(std::begin(k16), std::end(k16)); break;
+            default: out.title = "@seg7";  break;
             }
-            add(true, "DP");
-            add(false, "K");
+            if (digits == 1 && names.empty()) {
+                // Как у реального 10-выводного индикатора (5161AS и аналоги), вид сверху.
+                // Сверху слева направо (выводы 10…6): g, f, общий, a, b. Снизу слева направо (выводы 1…5): e, d, общий, c, DP.
+                // Два общих вывода внутри корпуса соединены между собой.
+                addE(2, "g"); addE(2, "f"); addE(2, "K"); addE(2, "a"); addE(2, "b");
+                addE(3, "e"); addE(3, "d"); addE(3, "K"); addE(3, "c"); addE(3, "DP");
+            } else if (digits == 1) {                     // остальные: сегменты, затем DP и общий — поровну сверху и снизу
+                if (withDp)
+                    names.push_back("DP");
+                names.push_back("K");
+                const std::size_t top = (names.size() + 1) / 2;
+                for (std::size_t i = 0; i < names.size(); ++i)
+                    addE(i < top ? 2 : 3, names[i]);
+            } else if (names.empty()) {
+                // Как у реального 4-разрядного индикатора на 12 выводов: сверху D1, a, f, D2, D3, b, снизу e, d, DP, c, g, D4.
+                // Для другого числа разрядов средние общие выводы идут сверху, последний — снизу.
+                addE(2, "D1"); addE(2, "a"); addE(2, "f");
+                for (int d = 2; d <= digits - 1; ++d)
+                    addE(2, "D" + std::to_string(d));
+                addE(2, "b");
+                addE(3, "e"); addE(3, "d"); addE(3, "DP"); addE(3, "c"); addE(3, "g");
+                addE(3, "D" + std::to_string(digits));
+            } else {
+                if (withDp)
+                    names.push_back("DP");
+                const std::size_t top = (names.size() + 1) / 2;
+                for (std::size_t i = 0; i < names.size(); ++i)
+                    addE(i < top ? 2 : 3, names[i]);
+                for (int d = 1; d <= digits; ++d)
+                    addE(d <= (digits + 1) / 2 ? 2 : 3, "D" + std::to_string(d));
+            }
             return out;
         }
         break;
@@ -580,6 +643,21 @@ inline ChipLayout layoutFor(const ElementInfo& info, unsigned variant)
                 addE(2, n);
             for (int i = 0; i < 8; ++i)
                 addE(3, "D" + std::to_string(i));
+            return out;
+        }
+        break;
+    case Dynamic::Karnaugh:
+        if (variant) {
+            // Карта Карно как таблица истинности: переменные A, B, … слева (сначала по строкам, затем по столбцам),
+            // выход F справа. Клетки (0 / 1 / X) хранит сам элемент: их число — ширина × высота.
+            out.title = "@kmap";
+            if ((variant >> 16) & 1u)            // «без выводов»: карта служит только таблицей для кликов
+                return out;
+            const auto bits = [](unsigned n) { int b = 0; while ((1u << b) < n) ++b; return b; };
+            const int vars = bits(variant & 0xFF) + bits((variant >> 8) & 0xFF);
+            for (int i = 0; i < vars; ++i)
+                add(true, std::string(1, static_cast<char>('A' + i)));
+            add(false, "F");
             return out;
         }
         break;
@@ -695,6 +773,7 @@ inline const std::vector<ElementInfo>& allElements()
         { T::Lamp, "lamp", "Лампа накаливания", C::Passive, { "1", "2" }, {
             { "voltage", "Номинальное напряжение", "V", 12.0, 1e-3, 1e4 },
             { "power",   "Номинальная мощность",   "W", 5.0,  1e-6, 1e5 },
+            { "glow", "Цвет свечения", "", 16762967.0, 0.0, 16777215.0, nullptr, true, true },
         } },
 
         // ---------------------------------------------------------- источники
@@ -744,6 +823,7 @@ inline const std::vector<ElementInfo>& allElements()
         { T::LED, "led", "Светодиод", C::Semiconductors, { "Анод", "Катод" }, {
             { "fwdDrop",    "Прямое падение напряжения", "V", 2.0,   0.0, 100.0 },
             { "maxCurrent", "Макс. ток",                 "A", 0.02,  0.0, 100.0 },
+            { "glow", "Цвет свечения", "", 15026237.0, 0.0, 16777215.0, nullptr, true, true },
         } },
 
         { T::NPN, "npn", "Транзистор биполярный n-p-n", C::Semiconductors, { "База", "Коллектор", "Эмиттер" }, {
@@ -1041,12 +1121,12 @@ inline const std::vector<ElementInfo>& allElements()
         chipInfo(T::CCII, "ccii", "Токовый конвейер (CCII)", C::Analog, "CCII;Y,X|Z", {
             { "polarity", "Тип", "", 0.0, 0.0, 1.0, "CCII+|CCII−" },
         }),
-        chipInfo(T::Regulator, "regulator", "Линейный стабилизатор напряжения (78xx)", C::Analog, "REG;IN,GND|OUT", {
+        chipInfo(T::Regulator, "regulator", "Линейный стабилизатор напряжения (78xx)", C::Analog, "78xx;IN|OUT||GND", {
             { "vout", "Выходное напряжение", "V", 5.0, 0.1, 100.0 },
             { "dropout", "Минимальное падение", "V", 2.0, 0.0, 50.0 },
             { "imax", "Макс. ток", "A", 1.0, 0.0, 100.0 },
         }),
-        chipInfo(T::Timer555, "timer555", "Таймер 555", C::Analog, "555;V+,RST,CTL,THR,TRIG,GND|OUT,DIS", {
+        chipInfo(T::Timer555, "timer555", "Таймер 555", C::Analog, "555;TRIG,THR,CTRL,RESET|OUT,DIS|V+|GND", {
             { "rdis", "Сопротивление ключа разряда", "Ω", 10.0, 0.1, 1000000.0 },
         }),
         chipInfo(T::VCO, "vco", "Генератор, управляемый напряжением (ГУН)", C::Analog, "VCO;Vу|Вых", {
@@ -1164,26 +1244,33 @@ inline const std::vector<ElementInfo>& allElements()
             { "fwdDrop", "Падение напряжения на диоде", "V", 0.7, 0.0, 10.0 },
         }, Dynamic::DiodeMatrix),
         chipInfo(T::SegDisplay, "seg_display", "Сегментный индикатор", C::Display, "@seg7;a,b,c,d,e,f,g,DP|K", {
-            { "segments", "Тип индикатора", "", 0.0, 0.0, 3.0, "7 сегментов|14 сегментов|16 сегментов|21 сегмент" },
+            { "segments", "Тип индикатора", "", 2.0, 0.0, 5.0, "3 сегмента (1 и знак)|5 сегментов|7 сегментов|9 сегментов|14 сегментов (звезда)|16 сегментов" },
+            { "digits", "Число разрядов (1…16)", "", 1.0, 1.0, 16.0, nullptr, true },
             { "vf", "Прямое падение напряжения сегмента", "V", 2.0, 0.0, 10.0 },
             { "common", "Общий вывод", "", 0.0, 0.0, 1.0, "Общий катод|Общий анод" },
+            { "glow", "Цвет свечения", "", 15026237.0, 0.0, 16777215.0, nullptr, true, true },
         }, Dynamic::SegDisplay),
         chipInfo(T::LedMatrix, "led_matrix", "Светодиодная матрица", C::Display, "@ledm;R0,R1,R2,R3,R4,R5,R6,R7|C0,C1,C2,C3,C4,C5,C6,C7", {
             { "rows", "Число строк (1…32)", "", 8.0, 1.0, 32.0, nullptr, true },
             { "cols", "Число столбцов (1…32)", "", 8.0, 1.0, 32.0, nullptr, true },
+            { "pinout", "Распиновка выводов", "", 0.0, 0.0, 1.0, "Как у реальной матрицы 8×8|По порядку" },
             { "vf", "Прямое падение напряжения", "V", 2.0, 0.0, 10.0 },
+            { "glow", "Цвет свечения", "", 15026237.0, 0.0, 16777215.0, nullptr, true, true },
         }, Dynamic::LedMatrix),
-        chipInfo(T::LedRGB, "led_rgb", "RGB-светодиод (общий катод)", C::Display, "RGB;R,G,B|K", {
+        // RGB-светодиод: обычный знак светодиода с тремя входами (анодами) R, G, B и общим катодом K.
+        { T::LedRGB, "led_rgb", "RGB-светодиод (общий катод)", C::Display, { "R", "G", "B", "K" }, {
             { "vfr", "Падение, красный", "V", 2.0, 0.0, 10.0 },
             { "vfg", "Падение, зелёный", "V", 3.0, 0.0, 10.0 },
             { "vfb", "Падение, синий", "V", 3.0, 0.0, 10.0 },
-        }),
+        } },
         { T::DecimalDisplay, "decimal_display", "Цифровой индикатор напряжения", C::Display, { "+", "−" }, {
-            { "digits", "Число знаков", "", 4.0, 1.0, 8.0 },
+            { "digits", "Число знаков", "", 4.0, 1.0, 8.0, nullptr, true },
             { "resistance", "Входное сопротивление", "Ω", 10000000.0, 1.0, 1000000000000000.0 },
+            { "glow", "Цвет цифр", "", 65142.0, 0.0, 16777215.0, nullptr, true, true },
         } },
         { T::LogicOutput, "logic_out", "Логический выход (индикатор 0/1)", C::Display, { "A" }, {
             { "threshold", "Порог переключения", "V", 2.5, 0.0, 1000.0 },
+            { "glow", "Цвет свечения", "", 8376221.0, 0.0, 16777215.0, nullptr, true, true },
         } },
         { T::Ohmmeter, "ohmmeter", "Омметр", C::Meters, { "1", "2" }, {
             { "current", "Измерительный ток", "A", 0.001, 1e-09, 1.0 },
@@ -1229,6 +1316,7 @@ inline const std::vector<ElementInfo>& allElements()
             { "strike", "Напряжение зажигания", "V", 90.0, 1.0, 10000.0 },
             { "hold", "Напряжение горения", "V", 60.0, 1.0, 10000.0 },
             { "ron", "Сопротивление при горении", "Ω", 500.0, 0.1, 1000000.0 },
+            { "glow", "Цвет свечения", "", 16747069.0, 0.0, 16777215.0, nullptr, true, true },
         } },
         { T::Motor, "motor", "Электродвигатель постоянного тока", C::Radio, { "1", "2" }, {
             { "resistance", "Сопротивление обмотки", "Ω", 5.0, 0.001, 1000000.0 },
@@ -1319,7 +1407,7 @@ inline const std::vector<ElementInfo>& allElements()
             { "ondelay", "Задержка включения", "s", 1.0, 0.0, 1000000.0 },
             { "offdelay", "Задержка отключения", "s", 0.0, 0.0, 1000000.0 },
         }),
-        chipInfo(T::LM317, "lm317", "Регулируемый стабилизатор LM317", C::Analog, "LM317;IN,ADJ|OUT", {
+        chipInfo(T::LM317, "lm317", "Регулируемый стабилизатор LM317", C::Analog, "LM317;IN|OUT||ADJ", {
             { "vref", "Опорное напряжение", "V", 1.25, 0.1, 10.0 },
             { "dropout", "Минимальное падение", "V", 2.0, 0.0, 50.0 },
             { "imax", "Макс. ток", "A", 1.5, 0.0, 100.0 },
@@ -1442,6 +1530,14 @@ inline const std::vector<ElementInfo>& allElements()
             { "mask", "Положение переключателей (битовая маска; бит n — позиция n+1)", "", 0.0, 0.0, 4294967295.0, nullptr, true },
             { "ron", "Сопротивление замкнутого контакта", "Ω", 0.1, 1e-06, 1000000.0 },
         }, Dynamic::Dip),
+        chipInfo(T::KarnaughMap, "karnaugh_map", "Карта Карно", C::Logic, "@kmap;A|F", {
+            { "width", "Ширина (столбцов, 1…16)", "", 4.0, 1.0, 16.0, nullptr, true },
+            { "height", "Высота (строк, 1…16)", "", 4.0, 1.0, 16.0, nullptr, true },
+            { "output", "Что выводить", "", 2.0, 0.0, 3.0, "СДНФ|СКНФ|Минимальная ДНФ|Минимальная КНФ" },
+            { "pins", "Выводы", "", 0.0, 0.0, 1.0, "Показывать|Убрать (только клики по клеткам)" },
+            { "vhigh", "Уровень логической 1", "V", 5.0, 0.0, 1000.0 },
+            { "threshold", "Порог переключения", "V", 2.5, 0.0, 1000.0 },
+        }, Dynamic::Karnaugh),
     };
     return kAll;
 }

@@ -3,6 +3,10 @@
 #include <QAction>
 #include <QActionGroup>
 #include <QContextMenuEvent>
+#include <QDesktopServices>
+#include <QDir>
+#include <QFileDialog>
+#include <QFileInfo>
 #include <QDockWidget>
 #include <QFrame>
 #include <QIcon>
@@ -16,6 +20,10 @@
 #include <QPainter>
 #include <QPixmap>
 #include <QPointer>
+#include <QProcess>
+#include <QUrl>
+#include <QScrollArea>
+#include <QStackedWidget>
 #include <QStatusBar>
 #include <QStringList>
 #include <QTabBar>
@@ -35,7 +43,17 @@
 #include "dialogs/SettingsDialog.h"
 #include "items/CircuitItem.h"
 #include "items/SymbolPainter.h"
+#include "scope/ScopeDialog.h"
+#include "sim/IssueLog.h"
+#include "sim/Preflight.h"
+#include "scope/ScopeItem.h"
+#include "scope/ScopeMenu.h"
+#include "scope/ScopeWidget.h"
+#include "project/ProjectFile.h"
+#include "project/ProjectPanel.h"
 #include "theme/Theme.h"
+#include "tools/KarnaughSection.h"
+#include "tools/KarnaughWidget.h"
 #include "widgets/PropertiesPanel.h"
 #include "widgets/SimulationPanel.h"
 
@@ -92,8 +110,8 @@ QIcon selectionIcon(const QColor &color)
     return icon;
 }
 
-// Значок «все элементы»: четыре квадратика.
-QIcon gridIcon(const QColor &color)
+// Значок «карта Карно»: сетка 3×3 с двумя закрашенными клетками.
+QIcon karnaughIcon(const QColor &color)
 {
     QIcon icon;
     for (int size : { 24, 32, 48 }) {
@@ -101,27 +119,33 @@ QIcon gridIcon(const QColor &color)
         pm.fill(Qt::transparent);
         QPainter p(&pm);
         p.setRenderHint(QPainter::Antialiasing);
+        const qreal margin = size * 0.16;
+        const qreal cell = (size - 2 * margin) / 3.0;
+        QPen pen(color, std::max(1.0, size / 22.0));
+        pen.setJoinStyle(Qt::MiterJoin);
+        p.setPen(pen);
+        p.setBrush(Qt::NoBrush);
+        p.drawRect(QRectF(margin, margin, cell * 3, cell * 3));
+        for (int i = 1; i < 3; ++i) {
+            p.drawLine(QPointF(margin + i * cell, margin), QPointF(margin + i * cell, margin + 3 * cell));
+            p.drawLine(QPointF(margin, margin + i * cell), QPointF(margin + 3 * cell, margin + i * cell));
+        }
         p.setPen(Qt::NoPen);
         p.setBrush(color);
-        const qreal margin = size * 0.22;
-        const qreal gap = size * 0.12;
-        const qreal cell = (size - 2 * margin - gap) / 2.0;
-        for (int row = 0; row < 2; ++row)
-            for (int col = 0; col < 2; ++col)
-                p.drawRoundedRect(QRectF(margin + col * (cell + gap), margin + row * (cell + gap), cell, cell),
-                                  cell * 0.22, cell * 0.22);
+        p.drawRect(QRectF(margin + cell, margin, cell, cell));
+        p.drawRect(QRectF(margin + 2 * cell, margin + cell, cell, cell));
         p.end();
         icon.addPixmap(pm);
     }
     return icon;
 }
 
-bool tabNameTaken(const QTabWidget *tabs, const QString &name, int except = -1)
+// Все открытые окна редактора: имена вкладок и их нумерация общие, чтобы при переносе вкладки
+// из одного окна в другое имена не конфликтовали.
+QList<EditorWindow *> &allEditors()
 {
-    for (int i = 0; i < tabs->count(); ++i)
-        if (i != except && tabs->tabText(i) == name)
-            return true;
-    return false;
+    static QList<EditorWindow *> list;
+    return list;
 }
 
 QVector<CircuitView *> allViews(const QTabWidget *tabs)
@@ -133,17 +157,32 @@ QVector<CircuitView *> allViews(const QTabWidget *tabs)
     return out;
 }
 
+QVector<QWidget *> allPages(const QTabWidget *tabs)
+{
+    QVector<QWidget *> out;
+    for (int i = 0; i < tabs->count(); ++i)
+        out.append(tabs->widget(i));
+    return out;
+}
+
 constexpr qreal kBaseFlowSpeed = 40.0;      // пикселей/с при множителе 1×
 
 } // namespace
 
 // ================================================================ создание
 
-EditorWindow::EditorWindow(QWidget *parent)
-    : QMainWindow(parent)
+EditorWindow::EditorWindow(QWidget *parent, bool standalone)
+    : QMainWindow(parent), m_standalone(standalone)
 {
-    setWindowFlags(Qt::Widget);       // вложенное окно внутри MainWindow
+    if (standalone) {                 // отдельное окно: закрывается и удаляется само
+        setAttribute(Qt::WA_DeleteOnClose);
+        setWindowTitle(QStringLiteral("Симулятор электрических цепей"));
+        resize(1200, 800);
+    } else {
+        setWindowFlags(Qt::Widget);   // вложенное окно внутри MainWindow
+    }
 
+    allEditors().append(this);
     m_undoGroup = new QUndoGroup(this);
 
     m_tabs = new EditorTabs(this);
@@ -151,7 +190,13 @@ EditorWindow::EditorWindow(QWidget *parent)
     m_tabs->setTabsClosable(false);          // свои кнопки закрытия — см. newTab()
     m_tabs->setMovable(true);
     m_tabs->setElideMode(Qt::ElideRight);
-    setCentralWidget(m_tabs);
+
+    // Два раздела: «Симулятор электронных цепей» (вкладки схем) и «Карты Карно» (свои вкладки).
+    m_karnaugh = new KarnaughSection(this);
+    m_stack = new QStackedWidget(this);
+    m_stack->addWidget(m_tabs);
+    m_stack->addWidget(m_karnaugh);
+    setCentralWidget(m_stack);
 
     buildActions();
     buildMenus();
@@ -160,15 +205,60 @@ EditorWindow::EditorWindow(QWidget *parent)
     buildStatusBar();
 
     connect(m_tabs, &QTabWidget::currentChanged, this, &EditorWindow::onTabChanged);
+    connect(m_tabs->bar(), &QTabBar::tabMoved, this, [] { ProjectHub::instance().notify(); });
     m_tabs->bar()->installEventFilter(this);
+    m_tabs->bar()->setOwner(this);
+    connect(m_tabs->bar(), &DetachableTabBar::detachRequested, this, &EditorWindow::detachTab);
+    connect(m_tabs->bar(), &DetachableTabBar::tabDropped, this, &EditorWindow::onTabDropped);
+    auto onDragEnded = [this] {
+        if (!m_closeAfterDrag)
+            return;
+        m_closeAfterDrag = false;
+        QTimer::singleShot(0, this, [this] { afterPagesChanged(); });
+    };
+    connect(m_tabs->bar(), &DetachableTabBar::dragEnded, this, onDragEnded);
+
+    // карты Карно тоже можно отрывать в новое окно и переносить между окнами
+    m_karnaugh->bar()->setOwner(this);
+    connect(m_karnaugh->bar(), &DetachableTabBar::detachRequested, this, &EditorWindow::detachMap);
+    connect(m_karnaugh->bar(), &DetachableTabBar::tabDropped, this, &EditorWindow::onMapDropped);
+    connect(m_karnaugh->bar(), &DetachableTabBar::dragEnded, this, onDragEnded);
+    connect(m_karnaugh, &KarnaughSection::becameEmpty, this, [this] {
+        QTimer::singleShot(0, this, [this] { afterPagesChanged(); });
+    });
+    connect(&ProjectHub::instance(), &ProjectHub::changed, this, &EditorWindow::refreshTabLabels);
+
+    if (standalone) {
+        m_menuAction->setText(QStringLiteral("Закрыть окно"));
+        connect(this, &EditorWindow::backToMainMenu, this, &QWidget::close);   // закрыли последнюю вкладку
+    }
 
     connect(&Theme::instance(), &Theme::changed, this, &EditorWindow::refreshIcons);
 
-    newTab();
+    if (!standalone) {
+        buildProjectDock();
+        newTab();
+        refreshProjectPanel();
+    }                     // в оторванное окно вкладку принесут сами
+}
+
+void EditorWindow::showEvent(QShowEvent *e)
+{
+    QMainWindow::showEvent(e);
+    if (m_docksSized || !m_simDock)
+        return;
+    m_docksSized = true;
+    // До показа окна Qt игнорирует размеры панелей, поэтому задаём их при первом показе.
+    resizeDocks({ m_simDock, m_propDock }, { 340, 340 }, Qt::Horizontal);
+    resizeDocks({ m_scopeDock }, { 240 }, Qt::Vertical);
+    if (m_projectDock && m_navDock)
+        resizeDocks({ m_navDock, m_projectDock }, { 64, 230 }, Qt::Horizontal);
 }
 
 EditorWindow::~EditorWindow()
 {
+    allEditors().removeAll(this);
+    ProjectHub::instance().notify();
     // Вкладки удаляются вместе с окном; к этому моменту наши обработчики
     // не должны больше реагировать на сигналы умирающих видов.
     for (const QMetaObject::Connection &c : std::as_const(m_viewConnections))
@@ -249,17 +339,38 @@ void EditorWindow::buildActions()
     m_newTabAction->setShortcut(QKeySequence(QStringLiteral("Ctrl+T")));
     connect(m_newTabAction, &QAction::triggered, this, [this] { newTab(); });
 
-    m_openAction = new QAction(QStringLiteral("Открыть…"), this);
-    m_openAction->setShortcut(QKeySequence::Open);
-    connect(m_openAction, &QAction::triggered, this, [this] { showNotYet(); });
+    m_karnaughAction = new QAction(QStringLiteral("Новая карта Карно"), this);
+    connect(m_karnaughAction, &QAction::triggered, this, [this] { newKarnaughTab(); });
 
-    m_saveAction = new QAction(QStringLiteral("Сохранить"), this);
+    m_newProjectAction = new QAction(QStringLiteral("Новый проект"), this);
+    connect(m_newProjectAction, &QAction::triggered, this, [this] { newProject(); });
+
+    m_openAction = new QAction(QStringLiteral("Открыть проект…"), this);
+    m_openAction->setShortcut(QKeySequence::Open);
+    connect(m_openAction, &QAction::triggered, this, [this] { openProject(); });
+
+    m_closeProjectAction = new QAction(QStringLiteral("Закрыть проект"), this);
+    connect(m_closeProjectAction, &QAction::triggered, this, [this] { closeProject(0); });
+
+    m_saveAction = new QAction(QStringLiteral("Сохранить проект"), this);
     m_saveAction->setShortcut(QKeySequence::Save);
-    connect(m_saveAction, &QAction::triggered, this, [this] { showNotYet(); });
+    connect(m_saveAction, &QAction::triggered, this, [this] { saveProject(0, false); });
+
+    m_saveAsAction = new QAction(QStringLiteral("Сохранить проект как…"), this);
+    m_saveAsAction->setShortcut(QKeySequence(QStringLiteral("Ctrl+Shift+S")));
+    connect(m_saveAsAction, &QAction::triggered, this, [this] { saveProject(0, true); });
+
+    m_renameProjectAction = new QAction(QStringLiteral("Переименовать проект…"), this);
+    connect(m_renameProjectAction, &QAction::triggered, this, [this] { renameProjectDialog(0); });
 
     m_closeTabAction = new QAction(QStringLiteral("Закрыть вкладку"), this);
     m_closeTabAction->setShortcut(QKeySequence(QStringLiteral("Ctrl+W")));
-    connect(m_closeTabAction, &QAction::triggered, this, [this] { closeTab(m_tabs->currentIndex()); });
+    connect(m_closeTabAction, &QAction::triggered, this, [this] {
+        if (m_stack->currentIndex() == 1)
+            m_karnaugh->closeCurrent();
+        else
+            closeTab(m_tabs->currentIndex());
+    });
 
     m_menuAction = new QAction(QStringLiteral("В главное меню"), this);
     connect(m_menuAction, &QAction::triggered, this, [this] { emit backToMainMenu(); });
@@ -401,8 +512,10 @@ void EditorWindow::refreshIcons()
         if (a)
             a->setIcon(elementIcon(info.type, color));
     }
-    if (m_allButton)
-        m_allButton->setIcon(gridIcon(color));
+    if (m_navSimAction)
+        m_navSimAction->setIcon(elementIcon(ElementType::Resistor, color));
+    if (m_navKarnaughAction)
+        m_navKarnaughAction->setIcon(karnaughIcon(color));
 }
 
 void EditorWindow::fillElementMenu(QMenu *menu)
@@ -427,8 +540,14 @@ void EditorWindow::buildMenus()
 {
     QMenu *file = menuBar()->addMenu(QStringLiteral("Файл"));
     file->addAction(m_newTabAction);
+    file->addAction(m_karnaughAction);
+    file->addSeparator();
+    file->addAction(m_newProjectAction);
     file->addAction(m_openAction);
     file->addAction(m_saveAction);
+    file->addAction(m_saveAsAction);
+    file->addAction(m_renameProjectAction);
+    file->addAction(m_closeProjectAction);
     file->addSeparator();
     file->addAction(m_closeTabAction);
     file->addAction(m_menuAction);
@@ -472,44 +591,60 @@ void EditorWindow::buildMenus()
 
 void EditorWindow::buildToolBars()
 {
-    // Только левая панель инструментов: остальные действия (файл, правка, вид) —
-    // в меню сверху, чтобы не дублировать их кнопками.
-    // --- левая: выбор и самые частые элементы -----------------------------
-    auto *tools = new QToolBar(QStringLiteral("Элементы"), this);
-    tools->setObjectName(QStringLiteral("toolsBar"));
-    tools->setOrientation(Qt::Vertical);
-    tools->setMovable(false);
-    tools->setFloatable(false);
-    tools->setIconSize(QSize(28, 28));
-    tools->setToolButtonStyle(Qt::ToolButtonIconOnly);
+    // Левая панель — переключатель разделов. Быстрых инструментов здесь нет:
+    // элементы выбираются через меню «Элементы» и ПКМ по схеме.
+    auto *nav = new QToolBar(QStringLiteral("Разделы"), this);
+    nav->setObjectName(QStringLiteral("navBar"));
+    nav->setOrientation(Qt::Vertical);
+    nav->setMovable(false);
+    nav->setFloatable(false);
+    nav->setIconSize(QSize(28, 28));
+    nav->setToolButtonStyle(Qt::ToolButtonIconOnly);       // узкая панель: только значки, подписи — в подсказках
+    nav->setStyleSheet(QStringLiteral("QToolButton { padding: 10px; }"));
 
-    tools->addAction(m_selectAction);
-    tools->addSeparator();
-    for (ElementType t : { ElementType::Wire, ElementType::Resistor, ElementType::Capacitor,
-                           ElementType::Inductor, ElementType::VoltageSourceDC, ElementType::Ground }) {
-        if (QAction *a = m_elementActions.value(int(t), nullptr))
-            tools->addAction(a);
-    }
-    tools->addSeparator();
+    m_navGroup = new QActionGroup(this);
+    m_navGroup->setExclusive(true);
 
-    // «Все элементы» — выпадающий список по категориям (тот же, что по ПКМ).
-    auto *popup = new QMenu(this);
-    popup->addAction(m_selectAction);
-    popup->addSeparator();
-    if (m_routedWireAction)
-        popup->addAction(m_routedWireAction);
-    fillElementMenu(popup);
+    m_navSimAction = new QAction(QStringLiteral("Симулятор\nэлектронных\nцепей"), this);
+    m_navSimAction->setCheckable(true);
+    m_navSimAction->setChecked(true);
+    m_navSimAction->setToolTip(QStringLiteral("Симулятор электронных цепей"));
+    m_navGroup->addAction(m_navSimAction);
+    connect(m_navSimAction, &QAction::triggered, this, [this] { showSection(0); });
 
-    m_allButton = new QToolButton(tools);
-    m_allButton->setObjectName(QStringLiteral("allElementsButton"));
-    m_allButton->setToolTip(QStringLiteral("Все элементы"));
-    m_allButton->setPopupMode(QToolButton::InstantPopup);
-    m_allButton->setMenu(popup);
-    m_allButton->setAutoRaise(true);
-    m_allButton->setIconSize(QSize(28, 28));
-    m_allButton->setStyleSheet(QStringLiteral("QToolButton::menu-indicator { image: none; }"));
-    tools->addWidget(m_allButton);
-    addToolBar(Qt::LeftToolBarArea, tools);
+    m_navKarnaughAction = new QAction(QStringLiteral("Карты\nКарно"), this);
+    m_navKarnaughAction->setCheckable(true);
+    m_navKarnaughAction->setToolTip(QStringLiteral("Карты Карно"));
+    m_navGroup->addAction(m_navKarnaughAction);
+    connect(m_navKarnaughAction, &QAction::triggered, this, [this] { showSection(1); });
+
+    nav->addAction(m_navSimAction);
+    nav->addAction(m_navKarnaughAction);
+
+    // Панель разделов — такая же док-панель, как остальные: её можно взять за заголовок сбоку,
+    // перенести к любому краю окна или оставить плавающей. У верхнего и нижнего краёв кнопки
+    // выстраиваются в ряд, у бокового и в плавающем виде — в столбик.
+    auto *navDock = new QDockWidget(QStringLiteral("Разделы"), this);
+    m_navDock = navDock;
+    navDock->setObjectName(QStringLiteral("navDock"));
+    navDock->setFeatures(QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetFloatable
+                         | QDockWidget::DockWidgetVerticalTitleBar);    // узкий заголовок сбоку, тянуть за него
+    navDock->setAllowedAreas(Qt::AllDockWidgetAreas);
+    navDock->setWidget(nav);
+
+    auto layoutNav = [nav](bool horizontal) {
+        nav->setOrientation(horizontal ? Qt::Horizontal : Qt::Vertical);
+        nav->setMaximumSize(horizontal ? QSize(QWIDGETSIZE_MAX, 64) : QSize(64, QWIDGETSIZE_MAX));
+    };
+    layoutNav(false);
+    connect(navDock, &QDockWidget::dockLocationChanged, this, [layoutNav](Qt::DockWidgetArea area) {
+        layoutNav(area == Qt::TopDockWidgetArea || area == Qt::BottomDockWidgetArea);
+    });
+    connect(navDock, &QDockWidget::topLevelChanged, this, [layoutNav](bool floating) {
+        if (floating)
+            layoutNav(false);
+    });
+    addDockWidget(Qt::LeftDockWidgetArea, navDock);
     refreshIcons();
 }
 
@@ -517,33 +652,79 @@ void EditorWindow::buildDock()
 {
     m_sim = new SimulationPanel(this);
     m_panel = new PropertiesPanel(this);
+    for (QWidget *w : { static_cast<QWidget *>(m_sim), static_cast<QWidget *>(m_panel) }) {
+        w->setObjectName(QStringLiteral("dockRoot"));
+        w->setAttribute(Qt::WA_StyledBackground, true);
+        w->setMinimumWidth(260);
+    }
 
-    // Правая панель как у Falstad: сверху симуляция, под ней свойства выбранного элемента.
-    auto *root = new QWidget(this);
-    root->setObjectName(QStringLiteral("dockRoot"));
-    root->setAttribute(Qt::WA_StyledBackground, true);
-    root->setMinimumWidth(280);
-    auto *lay = new QVBoxLayout(root);
-    lay->setContentsMargins(0, 0, 0, 0);
-    lay->setSpacing(0);
-    lay->addWidget(m_sim);
-    auto *sep = new QFrame(root);
-    sep->setObjectName(QStringLiteral("separator"));
-    sep->setFrameShape(QFrame::HLine);
-    lay->addWidget(sep);
-    lay->addWidget(m_panel, 1);
+    // Панели «Симуляция» и «Элемент» — отдельные окна-панели: их можно тянуть за заголовок,
+    // закреплять у любого края окна, складывать во вкладки или оставлять плавающими (как в Visual Studio).
+    setDockOptions(AnimatedDocks | AllowNestedDocks | AllowTabbedDocks);
+    setDockNestingEnabled(true);
 
-    m_dock = new QDockWidget(QStringLiteral("Панель"), this);
-    m_dock->setObjectName(QStringLiteral("sideDock"));
-    m_dock->setFeatures(QDockWidget::NoDockWidgetFeatures);
-    m_dock->setTitleBarWidget(new QWidget(m_dock));        // без заголовка — минимализм
-    m_dock->setWidget(root);
-    addDockWidget(Qt::RightDockWidgetArea, m_dock);
-    resizeDocks({ m_dock }, { 300 }, Qt::Horizontal);
+    auto makeDock = [this](const QString &title, const QString &name, QWidget *content) {
+        auto *dock = new QDockWidget(title, this);
+        dock->setObjectName(name);
+        dock->setFeatures(QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetFloatable
+                          | QDockWidget::DockWidgetClosable);
+        dock->setAllowedAreas(Qt::AllDockWidgetAreas);
+        dock->setWidget(content);
+        return dock;
+    };
+    // В тесном окне панель прокручивается, а не сжимает поля и кнопки друг на друга.
+    auto scrollable = [this](QWidget *content) {
+        auto *area = new QScrollArea(this);
+        area->setObjectName(QStringLiteral("dockScroll"));
+        area->setFrameShape(QFrame::NoFrame);
+        area->setWidgetResizable(true);
+        area->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        area->setMinimumWidth(300);                       // панель не должна схлопываться в узкую полоску
+        area->setWidget(content);
+        return area;
+    };
+    m_simDock = makeDock(QStringLiteral("Симуляция"), QStringLiteral("simDock"), scrollable(m_sim));
+    m_propDock = makeDock(QStringLiteral("Элемент"), QStringLiteral("propDock"), scrollable(m_panel));
+    addDockWidget(Qt::RightDockWidgetArea, m_simDock);
+    addDockWidget(Qt::RightDockWidgetArea, m_propDock);
+    resizeDocks({ m_simDock, m_propDock }, { 300, 300 }, Qt::Horizontal);
 
-    QAction *toggle = m_dock->toggleViewAction();
-    toggle->setText(QStringLiteral("Правая панель"));
-    m_viewMenu->addAction(toggle);
+    // Нижняя панель осциллограмм: все осциллограммы сразу, рядом или друг над другом (меню ПКМ),
+    // каждая со своими параметрами. Саму панель тоже можно двигать, закреплять и делать плавающей.
+    m_scopeBoard = new ScopeBoard(this);
+    connect(m_scopeBoard, &ScopeBoard::emptied, this, [this] { m_scopeDock->hide(); });
+    connect(m_scopeBoard, &ScopeBoard::windowRequested, this, &EditorWindow::detachScope);
+    connect(m_scopeBoard, &ScopeBoard::moveToSchemeRequested, this, &EditorWindow::scopeToScheme);
+    m_scopeDock = makeDock(QStringLiteral("Осциллограммы"), QStringLiteral("scopeDock"), m_scopeBoard);
+    addDockWidget(Qt::BottomDockWidgetArea, m_scopeDock);
+    resizeDocks({ m_scopeDock }, { 240 }, Qt::Vertical);
+    m_scopeDock->hide();                              // появляется, когда выбрали «Показать в нижней панели»
+
+    // Журнал симуляции: почему остановили, какие элементы виноваты. Живёт во вкладке рядом с осциллограммами.
+    m_log = new IssueLog(this);
+    connect(m_log, &IssueLog::issueActivated, this, [this](quint64 uid, const QVector<int> &pins) {
+        if (CircuitView *v = currentView())
+            v->focusItem(uid, pins);
+    });
+    m_logDock = makeDock(QStringLiteral("Журнал симуляции"), QStringLiteral("logDock"), m_log);
+    addDockWidget(Qt::BottomDockWidgetArea, m_logDock);
+    tabifyDockWidget(m_scopeDock, m_logDock);
+    m_logDock->hide();
+
+    QAction *logToggle = m_logDock->toggleViewAction();
+    logToggle->setText(QStringLiteral("Панель «Журнал симуляции»"));
+    m_viewMenu->addAction(logToggle);
+
+    QAction *scopeToggle = m_scopeDock->toggleViewAction();
+    scopeToggle->setText(QStringLiteral("Панель «Осциллограммы»"));
+    m_viewMenu->addAction(scopeToggle);
+
+    QAction *simToggle = m_simDock->toggleViewAction();
+    simToggle->setText(QStringLiteral("Панель «Симуляция»"));
+    m_viewMenu->addAction(simToggle);
+    QAction *propToggle = m_propDock->toggleViewAction();
+    propToggle->setText(QStringLiteral("Панель «Элемент»"));
+    m_viewMenu->addAction(propToggle);
 
     // двойной клик / кнопка «Все характеристики…» -> окно свойств
     connect(m_panel, &PropertiesPanel::detailsRequested, this, [this](CircuitItem *item) {
@@ -555,13 +736,11 @@ void EditorWindow::buildDock()
     connect(m_sim, &SimulationPanel::currentSpeedChanged, this, [](double factor) {
         CircuitItem::setFlowSpeed(kBaseFlowSpeed * factor);
     });
-    connect(m_sim, &SimulationPanel::runningChanged, this, [this](bool on) {
-        for (CircuitView *v : allViews(m_tabs))
-            v->setFlowAnimation(on);
-    });
+    connect(m_sim, &SimulationPanel::runningChanged, this, &EditorWindow::onSimulationToggled);
     connect(m_sim, &SimulationPanel::resetClicked, this, [this] {
         for (CircuitView *v : allViews(m_tabs))
             v->resetSimulationState();
+        clearIssues();
     });
     // simulationSpeedChanged и powerBrightnessChanged подключит ядро:
     // editor->simulationPanel() отдаёт панель целиком.
@@ -590,32 +769,438 @@ CircuitView *EditorWindow::currentView() const
     return m_view.data();
 }
 
-QString EditorWindow::nextTabName()
+CircuitView *EditorWindow::addScheme(int projectId, const QString &name)
 {
-    for (;;) {
-        const QString name = QStringLiteral("Схема %1").arg(++m_tabCounter);
-        if (!tabNameTaken(m_tabs, name))
-            return name;
-    }
-}
-
-QString EditorWindow::uniqueTabName(const QString &base)
-{
-    if (!tabNameTaken(m_tabs, base))
-        return base;
-    for (int n = 2;; ++n) {
-        const QString name = QStringLiteral("%1 %2").arg(base).arg(n);
-        if (!tabNameTaken(m_tabs, name))
-            return name;
-    }
+    ProjectHub &hub = ProjectHub::instance();
+    if (!hub.find(projectId))
+        projectId = hub.ensureActive();
+    showSection(0, false);
+    auto *view = new CircuitView;
+    view->setFlowAnimation(m_sim && m_sim->isRunning());
+    m_undoGroup->addStack(view->undoStack());
+    const QString unique = name.isEmpty() ? hub.nextName(projectId, ProjectHub::Scheme)
+                                          : hub.uniqueName(projectId, ProjectHub::Scheme, name);
+    ProjectHub::attach(view, projectId, ProjectHub::Scheme, unique);
+    connect(view->undoStack(), &QUndoStack::cleanChanged, view, [] { ProjectHub::instance().notify(); });   // «•» у проекта
+    addPageTab(view);
+    return view;
 }
 
 void EditorWindow::newTab()
 {
-    auto *view = new CircuitView;
-    view->setFlowAnimation(m_sim && m_sim->isRunning());
-    m_undoGroup->addStack(view->undoStack());
-    const int index = m_tabs->addTab(view, nextTabName());
+    addScheme(ProjectHub::instance().ensureActive())->setFocus();
+}
+
+void EditorWindow::newKarnaughTab()
+{
+    const bool hadMaps = m_karnaugh->tabCount() > 0;
+    showSection(1);                      // при первом входе в раздел он сам создаёт пустую карту
+    if (hadMaps)
+        m_karnaugh->newTab();
+}
+
+QWidget *EditorWindow::takeTab(int index)
+{
+    QWidget *page = m_tabs->widget(index);
+    if (!page)
+        return nullptr;
+
+    if (auto *view = qobject_cast<CircuitView *>(page)) {
+        if (view == m_view)
+            attachView(nullptr);
+        m_undoGroup->removeStack(view->undoStack());
+    }
+    m_tabs->removeTab(index);           // страница остаётся жить: её заберёт другое окно
+    ProjectHub::instance().notify();
+    return page;
+}
+
+void EditorWindow::adoptTab(QWidget *page, int at, bool reveal)
+{
+    if (reveal)
+        showSection(0, false);
+    if (auto *view = qobject_cast<CircuitView *>(page)) {
+        view->setFlowAnimation(m_sim && m_sim->isRunning());
+        m_undoGroup->addStack(view->undoStack());
+    }
+    addPageTab(page, at);
+}
+
+void EditorWindow::adoptMap(QWidget *page, int at, bool reveal)
+{
+    m_karnaugh->adoptPage(page, at);
+    if (reveal)
+        showSection(1, false);
+}
+
+void EditorWindow::detachTab(int index, const QPoint &globalPos)
+{
+    if (m_tabs->count() < 2)
+        return;                         // единственную вкладку окна не отрываем
+    QWidget *page = takeTab(index);
+    if (!page)
+        return;
+
+    auto *w = new EditorWindow(nullptr, true);
+    w->resize(std::min(width(), 1200), std::min(height(), 800));
+    w->move(globalPos - QPoint(80, 20));
+    w->adoptTab(page);
+    w->show();
+    w->raise();
+    w->activateWindow();
+}
+
+void EditorWindow::detachMap(int index, const QPoint &globalPos)
+{
+    if (m_karnaugh->tabCount() < 2)
+        return;
+    QWidget *page = m_karnaugh->takePage(index);
+    if (!page)
+        return;
+
+    auto *w = new EditorWindow(nullptr, true);
+    w->resize(std::min(width(), 1200), std::min(height(), 800));
+    w->move(globalPos - QPoint(80, 20));
+    w->adoptMap(page);
+    w->show();
+    w->raise();
+    w->activateWindow();
+}
+
+void EditorWindow::checkEmptyAfterMove()
+{
+    if (m_tabs->count() > 0 || m_karnaugh->tabCount() > 0)
+        return;
+    // Унесли последнюю страницу — окно пустое: закрываем его (основное окно возвращается в меню).
+    // Если перенос в нём ещё идёт, ждём его конца, чтобы не удалить полосу посреди перетаскивания.
+    if (DetachableTabBar::dragActive())
+        m_closeAfterDrag = true;
+    else
+        QTimer::singleShot(0, this, [this] { afterPagesChanged(); });
+}
+
+void EditorWindow::afterPagesChanged()
+{
+    const bool noSchemes = m_tabs->count() == 0;
+    const bool noMaps = m_karnaugh->tabCount() == 0;
+    if (noSchemes && noMaps) {
+        if (m_standalone)
+            close();
+        else
+            emit backToMainMenu();
+        return;
+    }
+    if (m_section == 0 && noSchemes)
+        showSection(1, false);
+    else if (m_standalone && m_section == 1 && noMaps)
+        showSection(0);
+}
+
+void EditorWindow::onTabDropped(DetachableTabBar *source, int sourceIndex, int targetIndex)
+{
+    QPointer<DetachableTabBar> src(source);
+    // Переносим после выхода из обработчика drop: страница могла быть под курсором.
+    QTimer::singleShot(0, this, [this, src, sourceIndex, targetIndex] {
+        if (!src)
+            return;
+        auto *from = qobject_cast<EditorWindow *>(src->owner());
+        if (!from)
+            return;
+
+        if (from == this) {             // вернули на ту же полосу — просто переставляем
+            int to = targetIndex;
+            if (to > sourceIndex)
+                --to;
+            if (to != sourceIndex && sourceIndex >= 0 && sourceIndex < m_tabs->count())
+                m_tabs->bar()->moveTab(sourceIndex, std::min(to, m_tabs->count() - 1));
+            return;
+        }
+        QWidget *page = from->takeTab(sourceIndex);
+        if (!page)
+            return;
+        adoptTab(page, targetIndex);
+        raise();
+        activateWindow();
+        from->checkEmptyAfterMove();
+    });
+}
+
+void EditorWindow::onMapDropped(DetachableTabBar *source, int sourceIndex, int targetIndex)
+{
+    QPointer<DetachableTabBar> src(source);
+    QTimer::singleShot(0, this, [this, src, sourceIndex, targetIndex] {
+        if (!src)
+            return;
+        auto *from = qobject_cast<EditorWindow *>(src->owner());
+        if (!from)
+            return;
+
+        if (from == this) {
+            int to = targetIndex;
+            if (to > sourceIndex)
+                --to;
+            DetachableTabBar *bar = m_karnaugh->bar();
+            if (to != sourceIndex && sourceIndex >= 0 && sourceIndex < m_karnaugh->tabCount())
+                bar->moveTab(sourceIndex, std::min(to, m_karnaugh->tabCount() - 1));
+            return;
+        }
+        QWidget *page = from->m_karnaugh->takePage(sourceIndex);
+        if (!page)
+            return;
+        adoptMap(page, targetIndex);
+        raise();
+        activateWindow();
+        from->checkEmptyAfterMove();
+    });
+}
+
+void EditorWindow::closeEvent(QCloseEvent *e)
+{
+    // Отрывное окно — лишь часть рабочей области: закрыли окно — его вкладки возвращаются в основное окно,
+    // а схемы и карты остаются в своих проектах.
+    if (m_standalone) {
+        EditorWindow *main = nullptr;
+        for (EditorWindow *w : std::as_const(allEditors()))
+            if (!w->isStandalone())
+                main = w;
+        if (main) {
+            while (m_tabs->count() > 0)
+                if (QWidget *page = takeTab(0))
+                    main->adoptTab(page, -1, false);
+            while (m_karnaugh->tabCount() > 0)
+                if (QWidget *page = m_karnaugh->takePage(0))
+                    main->adoptMap(page, -1, false);
+        }
+    }
+    QMainWindow::closeEvent(e);
+}
+
+void EditorWindow::showScopeInDock(CircuitItem *item)
+{
+    if (item)
+        showScopeInDock(item->probe(true));
+}
+
+void EditorWindow::showScopeInDock(ScopeSource *source)
+{
+    if (!source)
+        return;
+    m_scopeBoard->addScope(source);
+    m_scopeDock->show();
+    m_scopeDock->raise();
+}
+
+void EditorWindow::detachScope(ScopeSource *source)
+{
+    if (!source)
+        return;
+    m_scopeBoard->removeScope(source);
+
+    auto *win = new ScopeWindow(source);               // обычное окно приложения, его можно унести куда угодно
+    QPointer<ScopeWindow> guard(win);
+    connect(win, &ScopeWindow::dockRequested, this, [this, guard](ScopeSource *s) {
+        showScopeInDock(s);
+        if (guard)
+            guard->close();
+    });
+    connect(win, &ScopeWindow::moveToSchemeRequested, this, [this, guard](ScopeSource *s) {
+        scopeToScheme(s);
+        if (guard)
+            guard->close();
+    });
+    win->move(QCursor::pos() - QPoint(80, 30));
+    win->show();
+    win->raise();
+    win->activateWindow();
+}
+
+void EditorWindow::scopeToScheme(ScopeSource *source)
+{
+    CircuitItem *target = source ? source->target() : nullptr;
+    if (!target || !target->scene()) {
+        QMessageBox::information(this, QStringLiteral("Осциллограмма"),
+                                 QStringLiteral("Элемент этой осциллограммы удалён, на схему её не вернуть."));
+        return;
+    }
+    CircuitView *owner = nullptr;                      // схема, где лежит элемент (не обязательно текущая)
+    for (CircuitView *v : allViews(m_tabs))
+        if (v->circuitScene() == target->scene())
+            owner = v;
+    if (!owner) {
+        QMessageBox::information(this, QStringLiteral("Осциллограмма"),
+                                 QStringLiteral("Элемент находится в другом окне, там и прикрепите осциллограмму."));
+        return;
+    }
+    m_scopeBoard->removeScope(source);
+    owner->addScope(target);
+}
+
+void EditorWindow::showScopeMenu(ScopeItem *item, const QPoint &globalPos)
+{
+    if (!item)
+        return;
+    ScopeSource *src = item->source();
+    QPointer<ScopeItem> guard(item);
+    QPointer<CircuitView> view(currentView());
+
+    ScopeMenu::Actions a;
+    a.remove = [view, guard] {
+        if (view && guard)
+            view->removeScope(guard);
+    };
+    a.moveText = QStringLiteral("Переместить осциллограф в нижнюю панель");
+    a.move = [this, view, guard, src] {
+        showScopeInDock(src);
+        if (view && guard)
+            view->removeScope(guard);
+    };
+    a.windowText = QStringLiteral("Вынести в отдельное окно");
+    a.window = [this, view, guard, src] {
+        if (view && guard)
+            view->removeScope(guard);
+        detachScope(src);
+    };
+    ScopeMenu::exec(this, src, globalPos, a);
+}
+
+void EditorWindow::onSimulationToggled(bool on)
+{
+    if (on) {
+        // Проверки интерфейса до расчёта: сейчас — резистор у каждого подключённого вывода индикатора.
+        if (CircuitView *v = currentView()) {
+            const QVector<SimIssue> issues = Preflight::check(v->circuitScene());
+            if (hasErrors(issues)) {
+                stopSimulationWithIssues(issues);
+                return;
+            }
+        }
+        clearIssues();
+        for (CircuitView *v : allViews(m_tabs))
+            v->setFlowAnimation(true);
+        m_log->addMessage(SimIssue::Severity::Info, QStringLiteral("Симуляция запущена"));
+        // Здесь ядро получит схему и начнёт расчёт; результат — через CircuitItem::setElectrical / setLight,
+        // а если оно найдёт проблему — через stopSimulationWithIssues().
+    } else {
+        for (CircuitView *v : allViews(m_tabs))
+            v->setFlowAnimation(false);
+        m_log->addMessage(SimIssue::Severity::Info, QStringLiteral("Симуляция остановлена"));
+    }
+}
+
+void EditorWindow::stopSimulationWithIssues(const QVector<SimIssue> &issues)
+{
+    for (CircuitView *v : allViews(m_tabs))
+        v->setFlowAnimation(false);                         // резко: точки тока и анимация гаснут сразу
+    m_issues = issues;
+
+    const SimIssue *first = nullptr;
+    for (const SimIssue &i : issues)
+        if (i.isError()) {
+            first = &i;
+            break;
+        }
+    if (!first && !issues.isEmpty())
+        first = &issues.first();
+    const QString reason = first ? first->text : QStringLiteral("причина не указана");
+
+    m_sim->setStopped(reason);
+
+    if (CircuitView *v = currentView()) {
+        v->markProblems(issues);
+        QString message = reason;
+        if (issues.size() > 1)
+            message += QStringLiteral(" (и ещё проблем: %1)").arg(issues.size() - 1);
+        v->showStopBanner(QStringLiteral("Симуляция остановлена"), message);
+    }
+
+    m_log->addMessage(SimIssue::Severity::Error, QStringLiteral("Симуляция остановлена: проблем %1").arg(issues.size()));
+    for (const SimIssue &i : issues)
+        m_log->addIssue(i);
+    m_logDock->show();
+    m_logDock->raise();
+}
+
+void EditorWindow::clearIssues()
+{
+    m_issues.clear();
+    for (CircuitView *v : allViews(m_tabs)) {
+        v->clearProblems();
+        v->hideStopBanner();
+    }
+    if (m_sim && !m_sim->isRunning())
+        m_sim->setStatus(SimulationPanel::State::Idle, QStringLiteral("Готова к запуску"));
+}
+
+void EditorWindow::recheckIssues()
+{
+    CircuitView *v = currentView();
+    if (!v || !m_sim || (!m_sim->isRunning() && m_issues.isEmpty()))
+        return;
+    const QVector<SimIssue> issues = Preflight::check(v->circuitScene());
+
+    if (m_sim->isRunning()) {
+        if (hasErrors(issues))
+            stopSimulationWithIssues(issues);               // схему испортили на ходу — останавливаем
+        return;
+    }
+    if (!hasErrors(issues)) {                               // после остановки всё исправили
+        clearIssues();
+        m_log->addMessage(SimIssue::Severity::Info, QStringLiteral("Проблемы устранены: симуляцию можно запускать"));
+    } else if (issues.size() != m_issues.size()) {
+        m_issues = issues;
+        v->markProblems(issues);
+    }
+}
+
+void EditorWindow::showSection(int section, bool autoCreate)
+{
+    section = section == 1 ? 1 : 0;
+    m_stack->setCurrentIndex(section);
+    if (m_navSimAction)
+        m_navSimAction->setChecked(section == 0);
+    if (m_navKarnaughAction)
+        m_navKarnaughAction->setChecked(section == 1);
+
+    if (section == 1 && autoCreate && m_karnaugh->tabCount() == 0)
+        m_karnaugh->newTab();
+
+    if (m_simDock && m_propDock && m_scopeDock && m_logDock) {   // панели относятся только к схемам
+        if (section == 1 && m_section == 0) {
+            m_simDockWas = !m_simDock->isHidden();
+            m_propDockWas = !m_propDock->isHidden();
+            m_scopeDockWas = !m_scopeDock->isHidden();
+            m_logDockWas = !m_logDock->isHidden();
+            m_logDock->hide();
+            m_simDock->hide();
+            m_propDock->hide();
+            m_scopeDock->hide();
+        } else if (section == 0 && m_section == 1) {
+            m_simDock->setVisible(m_simDockWas);
+            m_propDock->setVisible(m_propDockWas);
+            m_scopeDock->setVisible(m_scopeDockWas);
+            m_logDock->setVisible(m_logDockWas);
+        }
+        m_simDock->toggleViewAction()->setEnabled(section == 0);
+        m_propDock->toggleViewAction()->setEnabled(section == 0);
+        m_scopeDock->toggleViewAction()->setEnabled(section == 0);
+        m_logDock->toggleViewAction()->setEnabled(section == 0);
+    }
+    m_section = section;
+    if (section == 0)
+        onTabChanged(m_tabs->currentIndex());
+    else
+        attachView(nullptr);
+    QWidget *current = section == 1 ? m_karnaugh->currentPage() : m_tabs->currentWidget();
+    if (current)
+        ProjectHub::instance().setActive(ProjectHub::projectOf(current));
+    if (m_projectPanel)
+        m_projectPanel->setCurrentPage(current);
+}
+
+void EditorWindow::addPageTab(QWidget *page, int at)
+{
+    const QString label = ProjectHub::instance().tabLabel(page);
+    const int index = at < 0 ? m_tabs->addTab(page, label) : m_tabs->insertTab(at, page, label);
 
     // Плоская кнопка «×» вместо стандартной иконки стиля. Закрытие — отложенно:
     // окно подтверждения не должно жить внутри обработчика клика по вкладке.
@@ -626,21 +1211,27 @@ void EditorWindow::newTab()
     close->setAutoRaise(true);
     close->setCursor(Qt::ArrowCursor);
     m_tabs->bar()->setTabButton(index, QTabBar::RightSide, close);
-    QPointer<QWidget> page = view;
-    connect(close, &QToolButton::clicked, this, [this, page] {
-        QTimer::singleShot(0, this, [this, page] {
-            if (page)
-                closeTab(m_tabs->indexOf(page));
+    QPointer<QWidget> guard = page;
+    connect(close, &QToolButton::clicked, this, [this, guard] {
+        QTimer::singleShot(0, this, [this, guard] {
+            if (guard)
+                closeTab(m_tabs->indexOf(guard));
         });
     });
 
     m_tabs->setCurrentIndex(index);
-    view->setFocus();
+    refreshTabLabels();
+    ProjectHub::instance().notify();
 }
 
 void EditorWindow::onTabChanged(int index)
 {
-    attachView(qobject_cast<CircuitView *>(m_tabs->widget(index)));
+    QWidget *page = m_tabs->widget(index);
+    attachView(qobject_cast<CircuitView *>(page));
+    if (page && m_section == 0)
+        ProjectHub::instance().setActive(ProjectHub::projectOf(page));
+    if (m_projectPanel)
+        m_projectPanel->setCurrentPage(page);
 }
 
 void EditorWindow::attachView(CircuitView *view)
@@ -676,6 +1267,19 @@ void EditorWindow::attachView(CircuitView *view)
     });
     m_viewConnections << connect(view, &CircuitView::contextMenuRequested,
                                  this, &EditorWindow::showContextMenu);
+    m_viewConnections << connect(view, &CircuitView::scopeActivated, this, [this](ScopeItem *scope) {
+        QPointer<ScopeItem> guard(scope);              // окно свойств — вне обработчика мыши холста
+        QTimer::singleShot(0, this, [this, guard] {
+            if (guard)
+                ScopeDialog::edit(this, guard->source());
+        });
+    });
+    m_viewConnections << connect(view, &CircuitView::scopeMenuRequested, this, &EditorWindow::showScopeMenu);
+    m_viewConnections << connect(view->circuitScene(), &CircuitScene::topologyChanged, this, &EditorWindow::recheckIssues);
+    m_viewConnections << connect(view, &CircuitView::bannerShowRequested, this, [this, view] {
+        if (!m_issues.isEmpty())
+            view->focusItem(m_issues.first().itemUid, m_issues.first().pins);
+    });
     m_viewConnections << connect(view->undoStack(), &QUndoStack::indexChanged,
                                  this, [this] { updateCount(); });
 
@@ -687,82 +1291,88 @@ void EditorWindow::attachView(CircuitView *view)
 
 void EditorWindow::removeTab(int index)
 {
-    auto *view = qobject_cast<CircuitView *>(m_tabs->widget(index));
-    if (!view)
+    QWidget *page = m_tabs->widget(index);
+    if (!page)
         return;
 
-    if (view == m_view)
-        attachView(nullptr);
-    m_undoGroup->removeStack(view->undoStack());
+    if (auto *view = qobject_cast<CircuitView *>(page)) {
+        if (view == m_view)
+            attachView(nullptr);
+        m_undoGroup->removeStack(view->undoStack());
+    }
     m_tabs->removeTab(index);       // currentChanged подключит соседнюю вкладку
-    view->deleteLater();
+    page->deleteLater();
+    ProjectHub::instance().notify();
 }
 
 void EditorWindow::closeTab(int index)
 {
-    auto *view = qobject_cast<CircuitView *>(m_tabs->widget(index));
-    if (!view)
+    QWidget *page = m_tabs->widget(index);
+    if (!page)
         return;
 
-    if (view->undoStack()->count() > 0) {
+    auto *view = qobject_cast<CircuitView *>(page);
+    if (view && !view->undoStack()->isClean()) {
         const auto answer = QMessageBox::question(
             this, QStringLiteral("Закрыть вкладку"),
-            QStringLiteral("Вкладка «%1» содержит изменения, а сохранение схем появится вместе с ядром.\n"
-                           "Закрыть без сохранения?").arg(m_tabs->tabText(index)),
+            QStringLiteral("Вкладка «%1» содержит несохранённые изменения.\n"
+                           "Закрыть без сохранения?").arg(ProjectHub::nameOf(page)),
             QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
         if (answer != QMessageBox::Yes)
             return;
     }
 
     removeTab(index);
-    if (m_tabs->count() == 0)
-        emit backToMainMenu();          // закрыли последнюю — возвращаемся в главное меню
+    afterPagesChanged();                // закрыли последнюю страницу — возвращаемся в главное меню
 }
 
-void EditorWindow::closeTabsWhere(const QVector<CircuitView *> &views)
+void EditorWindow::closeTabsWhere(const QVector<QWidget *> &pages)
 {
-    if (views.isEmpty())
+    if (pages.isEmpty())
         return;
 
     int dirty = 0;
-    for (CircuitView *v : views)
-        if (v->undoStack()->count() > 0)
+    for (QWidget *w : pages)
+        if (auto *v = qobject_cast<CircuitView *>(w); v && !v->undoStack()->isClean())
             ++dirty;
     if (dirty > 0) {
         const auto answer = QMessageBox::question(
             this, QStringLiteral("Закрыть вкладки"),
-            QStringLiteral("В закрываемых вкладках есть изменения (%1), а сохранение схем появится "
-                           "вместе с ядром.\nЗакрыть без сохранения?").arg(dirty),
+            QStringLiteral("В закрываемых вкладках есть несохранённые изменения (%1).\n"
+                           "Закрыть без сохранения?").arg(dirty),
             QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
         if (answer != QMessageBox::Yes)
             return;
     }
 
-    for (CircuitView *v : views) {
-        const int i = m_tabs->indexOf(v);
+    for (QWidget *w : pages) {
+        const int i = m_tabs->indexOf(w);
         if (i >= 0)
             removeTab(i);
     }
-    if (m_tabs->count() == 0)
-        emit backToMainMenu();
+    afterPagesChanged();
 }
 
 void EditorWindow::renameTab(int index)
 {
     if (index < 0 || index >= m_tabs->count())
         return;
+    QWidget *page = m_tabs->widget(index);
+    ProjectHub &hub = ProjectHub::instance();
     bool ok = false;
     const QString text = QInputDialog::getText(this, QStringLiteral("Переименовать вкладку"),
                                                QStringLiteral("Название:"), QLineEdit::Normal,
-                                               m_tabs->tabText(index), &ok).trimmed();
+                                               ProjectHub::nameOf(page), &ok).trimmed();
     if (!ok || text.isEmpty())
         return;
-    if (tabNameTaken(m_tabs, text, index)) {
+    if (hub.nameTaken(ProjectHub::projectOf(page), ProjectHub::Scheme, text, page)) {
         QMessageBox::warning(this, QStringLiteral("Ошибка"),
-                             QStringLiteral("Вкладка с таким именем уже существует."));
+                             QStringLiteral("Схема с таким именем уже есть в этом проекте."));
         return;
     }
-    m_tabs->setTabText(index, text);
+    ProjectHub::setNameOf(page, text);
+    refreshTabLabels();
+    hub.notify();
 }
 
 void EditorWindow::duplicateTab(int index)
@@ -771,18 +1381,16 @@ void EditorWindow::duplicateTab(int index)
     if (!src)
         return;
 
+    ProjectHub &hub = ProjectHub::instance();
+    const int project = ProjectHub::projectOf(src);
     const QVector<ItemData> data = src->snapshot(false);
-    const QString name = uniqueTabName(m_tabs->tabText(index) + QStringLiteral(" (копия)"));
+    const QString name = hub.uniqueName(project, ProjectHub::Scheme, ProjectHub::nameOf(src) + QStringLiteral(" (копия)"));
 
-    newTab();                                   // новая вкладка становится текущей
-    const int last = m_tabs->count() - 1;
-    m_tabs->setTabText(last, name);
-    m_tabs->bar()->moveTab(last, index + 1);    // рядом с исходной
-
-    if (CircuitView *dst = currentView()) {
-        dst->loadSnapshot(data, QStringLiteral("Копия схемы"));
-        dst->fitToContent();
-    }
+    CircuitView *dst = addScheme(project, name);          // новая вкладка становится текущей
+    m_tabs->bar()->moveTab(m_tabs->indexOf(dst), index + 1);   // рядом с исходной
+    dst->loadSnapshot(data, QStringLiteral("Копия схемы"));
+    dst->fitToContent();
+    hub.notify();
 }
 
 void EditorWindow::clearTab(int index)
@@ -835,20 +1443,18 @@ void EditorWindow::showTabMenu(int index, const QPoint &globalPos)
     } else if (chosen == aClose) {
         closeTab(idx);
     } else if (chosen == aOthers) {
-        QVector<CircuitView *> list;
+        QVector<QWidget *> list;
         for (int i = 0; i < m_tabs->count(); ++i)
             if (i != idx)
-                if (auto *v = qobject_cast<CircuitView *>(m_tabs->widget(i)))
-                    list.append(v);
+                list.append(m_tabs->widget(i));
         closeTabsWhere(list);
     } else if (chosen == aRight) {
-        QVector<CircuitView *> list;
+        QVector<QWidget *> list;
         for (int i = idx + 1; i < m_tabs->count(); ++i)
-            if (auto *v = qobject_cast<CircuitView *>(m_tabs->widget(i)))
-                list.append(v);
+            list.append(m_tabs->widget(i));
         closeTabsWhere(list);
     } else if (chosen == aAll) {
-        closeTabsWhere(allViews(m_tabs));
+        closeTabsWhere(allPages(m_tabs));
     }
 }
 
@@ -1058,51 +1664,9 @@ void EditorWindow::showContextMenu(const QPoint &globalPos)
     // ПКМ по элементу — меню действий над ним (а не список всех элементов).
     if (CircuitItem *target = v->contextItem()) {
         const QColor col = Theme::instance().palette().text;
-        const QColor dim = Theme::instance().palette().textDim;
-        const QList<CircuitItem *> sel = v->selectedCircuitItems();
-        const int count = std::max<int>(1, int(sel.size()));
 
         QMenu menu(this);
-        menu.setMinimumWidth(250);
-
-        auto *header = new QWidgetAction(&menu);
-        auto *box = new QWidget(&menu);
-        auto *row = new QHBoxLayout(box);
-        row->setContentsMargins(10, 8, 12, 8);
-        row->setSpacing(10);
-        auto *pic = new QLabel(box);
-        pic->setFixedSize(40, 40);
-        pic->setAlignment(Qt::AlignCenter);
-        if (count == 1)
-            pic->setPixmap(SymbolPainter::icon(target->elementType(), 36, col));
-        else
-            pic->setText(QString::number(count));
-        auto *col2 = new QVBoxLayout;
-        col2->setSpacing(1);
-        auto *title = new QLabel(count == 1 ? target->displayName()
-                                            : QStringLiteral("Выбрано элементов: %1").arg(count), box);
-        QFont tf = title->font();
-        tf.setBold(true);
-        tf.setPointSizeF(tf.pointSizeF() + 1.0);
-        title->setFont(tf);
-        QString subText;
-        if (count == 1) {
-            const ElementInfo &info = elementInfo(target->elementType());
-            subText = QString::fromUtf8(categoryName(info.category));
-            if (target->pinCount() > 0)
-                subText += QStringLiteral(" · выводов: %1").arg(target->pinCount());
-        } else {
-            subText = QStringLiteral("действия применятся ко всем");
-        }
-        auto *sub = new QLabel(subText, box);
-        sub->setStyleSheet(QStringLiteral("color: %1;").arg(dim.name()));
-        col2->addWidget(title);
-        col2->addWidget(sub);
-        row->addWidget(pic);
-        row->addLayout(col2, 1);
-        header->setDefaultWidget(box);
-        menu.addAction(header);
-        menu.addSeparator();
+        menu.setMinimumWidth(210);
 
         m_propsAction->setIcon(menuGlyph(MenuGlyph::Props, col));
         m_toggleAction->setIcon(menuGlyph(MenuGlyph::Toggle, col));
@@ -1117,6 +1681,16 @@ void EditorWindow::showContextMenu(const QPoint &globalPos)
             menu.addAction(m_propsAction);
         if (v->selectionHasToggle())
             menu.addAction(m_toggleAction);
+
+        // Осциллограмма элемента: на схему отдельным окошком или в нижнюю панель.
+        if (!target->isDecoration()) {
+            menu.addSeparator();
+            QMenu *scopeMenu = menu.addMenu(QStringLiteral("Осциллограмма"));
+            QAction *onScheme = scopeMenu->addAction(QStringLiteral("Прикрепить к схеме (новый элемент)"));
+            QAction *inDock = scopeMenu->addAction(QStringLiteral("Показать в нижней панели"));
+            connect(onScheme, &QAction::triggered, this, [v, target] { v->addScope(target); });
+            connect(inDock, &QAction::triggered, this, [this, target] { showScopeInDock(target); });
+        }
         menu.addSeparator();
         menu.addAction(m_rotateCwAction);
         menu.addAction(m_rotateCcwAction);
@@ -1256,6 +1830,505 @@ void EditorWindow::showAbout()
                        "Клон идеи Falstad Circuit Simulator на C++ / Qt.<br>"
                        "Условные обозначения — по ГОСТ 2.721-74 и смежным стандартам ЕСКД.<br><br>"
                        "Готова визуальная оболочка (gui). Расчёт цепей будет подключён из ядра (core)."));
+}
+
+// ================================================================== проекты
+
+namespace {
+
+QVector<EditorWindow *> projectEditors()
+{
+    QVector<EditorWindow *> out;                        // основное окно первым, затем оторванные
+    for (EditorWindow *w : std::as_const(allEditors()))
+        if (!w->isStandalone())
+            out.append(w);
+    for (EditorWindow *w : std::as_const(allEditors()))
+        if (w->isStandalone())
+            out.append(w);
+    return out;
+}
+
+const QString kProjectFilter = QStringLiteral("Проект GOVNO (*.govno)");
+
+} // namespace
+
+void EditorWindow::buildProjectDock()
+{
+    m_projectPanel = new ProjectPanel(this);
+    m_projectDock = new QDockWidget(QStringLiteral("Проекты"), this);
+    m_projectDock->setObjectName(QStringLiteral("projectDock"));
+    m_projectDock->setFeatures(QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetFloatable
+                               | QDockWidget::DockWidgetClosable);
+    m_projectDock->setAllowedAreas(Qt::AllDockWidgetAreas);
+    m_projectDock->setWidget(m_projectPanel);
+    addDockWidget(Qt::LeftDockWidgetArea, m_projectDock);
+    if (m_navDock)
+        splitDockWidget(m_navDock, m_projectDock, Qt::Horizontal);   // рядом с узкой панелью разделов
+
+    QAction *toggle = m_projectDock->toggleViewAction();
+    toggle->setText(QStringLiteral("Панель «Проекты»"));
+    m_viewMenu->addAction(toggle);
+
+    connect(&ProjectHub::instance(), &ProjectHub::changed, this, &EditorWindow::refreshProjectPanel);
+    connect(m_projectPanel, &ProjectPanel::pageActivated, this, [](QWidget *page) { activatePage(page); });
+    connect(m_projectPanel, &ProjectPanel::pageRenameRequested, this, [](QWidget *page) { renamePage(page); });
+    connect(m_projectPanel, &ProjectPanel::pageCloseRequested, this, [](QWidget *page) { closePage(page); });
+    connect(m_projectPanel, &ProjectPanel::newSchemeRequested, this, [this](int id) { addSchemeTo(id); });
+    connect(m_projectPanel, &ProjectPanel::newMapRequested, this, [this](int id) { addMapTo(id); });
+    connect(m_projectPanel, &ProjectPanel::projectActivated, this, [this](int id) { activateProject(id); });
+    connect(m_projectPanel, &ProjectPanel::projectRenameRequested, this, [this](int id) { renameProjectDialog(id); });
+    connect(m_projectPanel, &ProjectPanel::projectSaveRequested, this, [this](int id) { saveProject(id, false); });
+    connect(m_projectPanel, &ProjectPanel::projectSaveAsRequested, this, [this](int id) { saveProject(id, true); });
+    connect(m_projectPanel, &ProjectPanel::projectExplorerRequested, this, [this](int id) { openProjectInExplorer(id); });
+    connect(m_projectPanel, &ProjectPanel::projectHideToggled, this, [this](int id) {
+        const ProjectInfo *p = ProjectHub::instance().find(id);
+        if (p)
+            setProjectHidden(id, !p->hidden);
+    });
+    connect(m_projectPanel, &ProjectPanel::projectCloseRequested, this, [this](int id) { closeProject(id); });
+    connect(m_projectPanel, &ProjectPanel::projectDeleteRequested, this, [this](int id) { deleteProject(id); });
+    connect(m_projectPanel, &ProjectPanel::newProjectRequested, this, [this] { newProject(); });
+    connect(m_projectPanel, &ProjectPanel::openProjectRequested, this, [this] { openProject(); });
+}
+
+void EditorWindow::refreshTabLabels()
+{
+    const ProjectHub &hub = ProjectHub::instance();
+    for (int i = 0; i < m_tabs->count(); ++i) {
+        QWidget *w = m_tabs->widget(i);
+        const QString label = hub.tabLabel(w);
+        if (m_tabs->tabText(i) != label)
+            m_tabs->setTabText(i, label);
+        const ProjectInfo *p = hub.find(ProjectHub::projectOf(w));
+        m_tabs->setTabToolTip(i, p ? QStringLiteral("%1 — %2").arg(p->name, ProjectHub::nameOf(w)) : ProjectHub::nameOf(w));
+    }
+    m_karnaugh->refreshLabels();
+}
+
+void EditorWindow::refreshProjectPanel()
+{
+    if (!m_projectPanel)
+        return;
+    const ProjectHub &hub = ProjectHub::instance();
+    QVector<ProjectPanel::ProjectEntry> list;
+    for (const ProjectInfo &p : hub.projects()) {
+        ProjectPanel::ProjectEntry e;
+        e.id = p.id;
+        e.name = p.name;
+        e.path = p.path;
+        e.hidden = p.hidden;
+        e.active = p.id == hub.activeId();
+        list.append(e);
+    }
+    auto entryFor = [&list](int id) -> ProjectPanel::ProjectEntry * {
+        for (ProjectPanel::ProjectEntry &e : list)
+            if (e.id == id)
+                return &e;
+        return nullptr;
+    };
+    for (EditorWindow *w : projectEditors()) {
+        const QString note = w->isStandalone() ? QStringLiteral("в отдельном окне") : QString();
+        for (int i = 0; i < w->m_tabs->count(); ++i) {
+            QWidget *page = w->m_tabs->widget(i);
+            ProjectPanel::ProjectEntry *e = entryFor(ProjectHub::projectOf(page));
+            if (!e)
+                continue;
+            e->schemes.append({ ProjectHub::nameOf(page), page, note });
+            if (auto *v = qobject_cast<CircuitView *>(page); v && !v->undoStack()->isClean())
+                e->dirty = true;
+        }
+        for (int i = 0; i < w->m_karnaugh->tabCount(); ++i) {
+            QWidget *page = w->m_karnaugh->page(i);
+            if (ProjectPanel::ProjectEntry *e = entryFor(ProjectHub::projectOf(page)))
+                e->maps.append({ ProjectHub::nameOf(page), page, note });
+        }
+    }
+    m_projectPanel->setContent(list);
+    m_projectPanel->setCurrentPage(m_section == 1 ? m_karnaugh->currentPage() : m_tabs->currentWidget());
+}
+
+EditorWindow *EditorWindow::ownerOf(QWidget *page)
+{
+    for (EditorWindow *w : projectEditors())
+        if (w->m_tabs->indexOf(page) >= 0 || w->m_karnaugh->contains(page))
+            return w;
+    return nullptr;
+}
+
+void EditorWindow::applyProjectVisibility(int projectId)
+{
+    const ProjectInfo *info = ProjectHub::instance().find(projectId);
+    const bool visible = info && !info->hidden;
+    for (QWidget *page : ProjectHub::instance().pagesOf(projectId)) {
+        EditorWindow *w = ownerOf(page);
+        if (!w)
+            continue;
+        const int i = w->m_tabs->indexOf(page);
+        if (i < 0) {
+            w->m_karnaugh->setPageVisible(page, visible);
+            continue;
+        }
+        w->m_tabs->setTabVisible(i, visible);
+        if (!visible && w->m_tabs->currentIndex() == i)
+            for (int k = 0; k < w->m_tabs->count(); ++k)
+                if (w->m_tabs->isTabVisible(k)) {
+                    w->m_tabs->setCurrentIndex(k);
+                    break;
+                }
+    }
+}
+
+void EditorWindow::setProjectHidden(int projectId, bool hidden)
+{
+    ProjectHub::instance().setHidden(projectId, hidden);
+    applyProjectVisibility(projectId);
+}
+
+bool EditorWindow::activatePage(QWidget *page)
+{
+    EditorWindow *w = ownerOf(page);
+    if (!w)
+        return false;
+    const int project = ProjectHub::projectOf(page);
+    const ProjectInfo *info = ProjectHub::instance().find(project);
+    if (info && info->hidden)
+        setProjectHidden(project, false);
+    const int i = w->m_tabs->indexOf(page);
+    if (i >= 0) {
+        w->showSection(0, false);
+        w->m_tabs->setCurrentIndex(i);
+    } else {
+        w->showSection(1, false);
+        w->m_karnaugh->select(page);
+    }
+    w->window()->raise();
+    w->window()->activateWindow();
+    return true;
+}
+
+void EditorWindow::activateProject(int projectId)
+{
+    ProjectHub &hub = ProjectHub::instance();
+    const ProjectInfo *info = hub.find(projectId);
+    if (!info)
+        return;
+    if (info->hidden)
+        setProjectHidden(projectId, false);
+    hub.setActive(projectId);
+    const QVector<QWidget *> pages = hub.pagesOf(projectId);
+    if (!pages.isEmpty())
+        activatePage(pages.first());
+}
+
+void EditorWindow::addSchemeTo(int projectId)
+{
+    const ProjectInfo *info = ProjectHub::instance().find(projectId);
+    if (!info)
+        return;
+    if (info->hidden)
+        setProjectHidden(projectId, false);
+    addScheme(projectId)->setFocus();
+}
+
+void EditorWindow::addMapTo(int projectId)
+{
+    const ProjectInfo *info = ProjectHub::instance().find(projectId);
+    if (!info)
+        return;
+    if (info->hidden)
+        setProjectHidden(projectId, false);
+    m_karnaugh->addMap(projectId);
+    showSection(1, false);
+}
+
+void EditorWindow::renamePage(QWidget *page)
+{
+    EditorWindow *w = ownerOf(page);
+    if (!w)
+        return;
+    const int i = w->m_tabs->indexOf(page);
+    if (i >= 0)
+        w->renameTab(i);
+    else
+        w->m_karnaugh->renamePage(page);
+}
+
+void EditorWindow::closePage(QWidget *page)
+{
+    EditorWindow *w = ownerOf(page);
+    if (!w)
+        return;
+    QPointer<QWidget> guard(page);
+    QPointer<EditorWindow> window(w);
+    if (w->m_tabs->indexOf(page) >= 0) {
+        QTimer::singleShot(0, w, [window, guard] {            // окно вопроса — вне обработчика меню
+            if (window && guard)
+                window->closeTab(window->m_tabs->indexOf(guard));
+        });
+    } else {
+        w->m_karnaugh->closePage(page);
+    }
+}
+
+ProjectDoc EditorWindow::collectProject(int projectId) const
+{
+    ProjectDoc doc;
+    if (const ProjectInfo *info = ProjectHub::instance().find(projectId))
+        doc.name = info->name;
+    for (EditorWindow *w : projectEditors()) {
+        for (int i = 0; i < w->m_tabs->count(); ++i) {
+            QWidget *page = w->m_tabs->widget(i);
+            if (ProjectHub::projectOf(page) != projectId)
+                continue;
+            if (auto *view = qobject_cast<CircuitView *>(page))
+                doc.schemes.append({ ProjectHub::nameOf(page), view->snapshot(false) });
+        }
+        for (int i = 0; i < w->m_karnaugh->tabCount(); ++i) {
+            QWidget *page = w->m_karnaugh->page(i);
+            if (ProjectHub::projectOf(page) != projectId)
+                continue;
+            if (auto *map = qobject_cast<KarnaughWidget *>(page)) {
+                const KarnaughWidget::State st = map->state();
+                MapDoc m;
+                m.name = ProjectHub::nameOf(page);
+                m.width = st.width;
+                m.height = st.height;
+                m.cells = st.cells;
+                m.names = st.names;
+                m.namesEdited = st.namesEdited;
+                doc.maps.append(m);
+            }
+        }
+    }
+    return doc;
+}
+
+bool EditorWindow::projectDirty(int projectId) const
+{
+    for (QWidget *page : ProjectHub::instance().pagesOf(projectId))
+        if (auto *v = qobject_cast<CircuitView *>(page); v && !v->undoStack()->isClean())
+            return true;
+    return false;
+}
+
+int EditorWindow::createProjectFromDoc(const ProjectDoc &doc, const QString &path)
+{
+    ProjectHub &hub = ProjectHub::instance();
+    const QString base = !doc.name.isEmpty() ? doc.name
+                       : !path.isEmpty() ? QFileInfo(path).completeBaseName() : QStringLiteral("Новый проект");
+    const int id = hub.create(hub.uniqueProjectName(base), path);
+
+    QWidget *firstScheme = nullptr;
+    for (const SchemeDoc &s : doc.schemes) {
+        CircuitView *view = addScheme(id, s.name);
+        view->loadSnapshot(s.items, QString());
+        view->fitToContent();
+        view->undoStack()->clear();
+        view->undoStack()->setClean();
+        if (!firstScheme)
+            firstScheme = view;
+    }
+    for (const MapDoc &m : doc.maps) {
+        if (KarnaughWidget *map = m_karnaugh->addMap(id, m.name)) {
+            KarnaughWidget::State st;
+            st.width = m.width;
+            st.height = m.height;
+            st.cells = m.cells;
+            st.names = m.names;
+            st.namesEdited = m.namesEdited;
+            map->setState(st);
+        }
+    }
+    if (doc.schemes.isEmpty() && doc.maps.isEmpty())
+        firstScheme = addScheme(id);
+
+    hub.setActive(id);
+    if (firstScheme) {
+        showSection(0, false);
+        m_tabs->setCurrentWidget(firstScheme);
+    } else {
+        showSection(1, false);
+        m_karnaugh->select(m_karnaugh->page(m_karnaugh->tabCount() - 1));
+    }
+    return id;
+}
+
+void EditorWindow::newProject()
+{
+    ProjectHub &hub = ProjectHub::instance();
+    const int id = hub.create(hub.uniqueProjectName(QStringLiteral("Новый проект")));
+    addScheme(id);
+    refreshProjectPanel();
+}
+
+void EditorWindow::openProject()
+{
+    const QString path = QFileDialog::getOpenFileName(this, QStringLiteral("Открыть проект"), QString(), kProjectFilter);
+    if (!path.isEmpty())
+        openProjectFile(path);
+}
+
+bool EditorWindow::openProjectFile(const QString &path)
+{
+    ProjectHub &hub = ProjectHub::instance();
+    if (const int already = hub.findByPath(path)) {          // проект уже открыт — просто переходим к нему
+        activateProject(already);
+        return true;
+    }
+    ProjectDoc doc;
+    QString error;
+    int skipped = 0;
+    if (!ProjectFile::load(path, &doc, &error, &skipped)) {
+        QMessageBox::warning(this, QStringLiteral("Открыть проект"),
+                             QStringLiteral("Не удалось открыть «%1»: %2.").arg(QFileInfo(path).fileName(), error));
+        return false;
+    }
+    createProjectFromDoc(doc, path);
+    refreshProjectPanel();
+    if (skipped > 0)
+        QMessageBox::information(this, QStringLiteral("Открыть проект"),
+            QStringLiteral("Элементов неизвестного типа пропущено: %1. Файл создан другой версией программы.").arg(skipped));
+    statusBar()->showMessage(QStringLiteral("Проект открыт: %1").arg(QDir::toNativeSeparators(path)), 5000);
+    return true;
+}
+
+bool EditorWindow::saveProject(int projectId, bool saveAs)
+{
+    ProjectHub &hub = ProjectHub::instance();
+    if (projectId == 0)
+        projectId = hub.ensureActive();
+    const ProjectInfo *info = hub.find(projectId);
+    if (!info)
+        return false;
+
+    QString path = info->path;
+    if (saveAs || path.isEmpty()) {
+        const QString suggestion = info->name + QLatin1Char('.') + ProjectFile::kExtension;
+        path = QFileDialog::getSaveFileName(this, QStringLiteral("Сохранить проект «%1»").arg(info->name),
+                                            path.isEmpty() ? suggestion : path, kProjectFilter);
+        if (path.isEmpty())
+            return false;
+        if (QFileInfo(path).suffix().isEmpty())
+            path += QLatin1Char('.') + ProjectFile::kExtension;
+        const int other = hub.findByPath(path);
+        if (other && other != projectId) {
+            QMessageBox::warning(this, QStringLiteral("Сохранить проект"),
+                                 QStringLiteral("Этот файл уже занят другим открытым проектом."));
+            return false;
+        }
+        if (info->name.startsWith(QStringLiteral("Новый проект")))
+            hub.setName(projectId, hub.uniqueProjectName(QFileInfo(path).completeBaseName()));   // первое сохранение: имя — по файлу
+    }
+
+    QString error;
+    if (!ProjectFile::save(path, collectProject(projectId), &error)) {
+        QMessageBox::warning(this, QStringLiteral("Сохранить проект"),
+                             QStringLiteral("Не удалось сохранить «%1»: %2.").arg(QFileInfo(path).fileName(), error));
+        return false;
+    }
+    hub.setPath(projectId, path);
+    for (QWidget *page : hub.pagesOf(projectId))
+        if (auto *v = qobject_cast<CircuitView *>(page))
+            v->undoStack()->setClean();
+    statusBar()->showMessage(QStringLiteral("Проект сохранён: %1").arg(QDir::toNativeSeparators(path)), 5000);
+    hub.notify();
+    return true;
+}
+
+void EditorWindow::closeProject(int projectId, bool askToSave)
+{
+    ProjectHub &hub = ProjectHub::instance();
+    if (projectId == 0)
+        projectId = hub.activeId();
+    const ProjectInfo *info = hub.find(projectId);
+    if (!info)
+        return;
+    if (askToSave && projectDirty(projectId)) {
+        const auto answer = QMessageBox::question(
+            this, QStringLiteral("Закрыть проект"),
+            QStringLiteral("В проекте «%1» есть несохранённые изменения. Сохранить их?").arg(info->name),
+            QMessageBox::Save | QMessageBox::Discard | QMessageBox::Cancel, QMessageBox::Save);
+        if (answer == QMessageBox::Cancel)
+            return;
+        if (answer == QMessageBox::Save && !saveProject(projectId, false))
+            return;
+    }
+
+    QVector<QPointer<EditorWindow>> owners;
+    for (QWidget *page : hub.pagesOf(projectId)) {
+        EditorWindow *w = ownerOf(page);
+        if (!w)
+            continue;
+        const int i = w->m_tabs->indexOf(page);
+        if (i >= 0)
+            w->removeTab(i);
+        else
+            w->m_karnaugh->closePage(page);
+        owners.append(w);
+    }
+    hub.remove(projectId);
+    for (const QPointer<EditorWindow> &w : std::as_const(owners))
+        if (w)
+            w->afterPagesChanged();
+}
+
+void EditorWindow::deleteProject(int projectId)
+{
+    ProjectHub &hub = ProjectHub::instance();
+    const ProjectInfo *info = hub.find(projectId);
+    if (!info)
+        return;
+    const QString name = info->name;
+    const QString path = info->path;
+    const bool onDisk = !path.isEmpty() && QFile::exists(path);
+    const QString text = onDisk
+        ? QStringLiteral("Удалить проект «%1»?\nФайл «%2» будет удалён с диска без возможности восстановления, "
+                         "вкладки проекта закроются.").arg(name, QDir::toNativeSeparators(path))
+        : QStringLiteral("Удалить проект «%1»?\nУ него нет файла на диске: вкладки закроются, несохранённые "
+                         "изменения пропадут.").arg(name);
+    if (QMessageBox::question(this, QStringLiteral("Удалить проект"), text,
+                              QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes)
+        return;
+    if (onDisk && !QFile::remove(path)) {
+        QMessageBox::warning(this, QStringLiteral("Удалить проект"),
+                             QStringLiteral("Не удалось удалить файл «%1».").arg(QDir::toNativeSeparators(path)));
+        return;
+    }
+    closeProject(projectId, false);
+}
+
+void EditorWindow::openProjectInExplorer(int projectId)
+{
+    const ProjectInfo *info = ProjectHub::instance().find(projectId);
+    if (!info)
+        return;
+    if (info->path.isEmpty() || !QFile::exists(info->path)) {
+        QMessageBox::information(this, QStringLiteral("Открыть в проводнике"),
+                                 QStringLiteral("Проект «%1» ещё не сохранён: у него нет файла на диске.").arg(info->name));
+        return;
+    }
+#ifdef Q_OS_WIN
+    QProcess::startDetached(QStringLiteral("explorer.exe"),
+                            { QStringLiteral("/select,"), QDir::toNativeSeparators(info->path) });   // папка с выделенным файлом
+#else
+    QDesktopServices::openUrl(QUrl::fromLocalFile(QFileInfo(info->path).absolutePath()));
+#endif
+}
+
+void EditorWindow::renameProjectDialog(int projectId)
+{
+    ProjectHub &hub = ProjectHub::instance();
+    if (projectId == 0)
+        projectId = hub.ensureActive();
+    const ProjectInfo *info = hub.find(projectId);
+    if (!info)
+        return;
+    bool ok = false;
+    const QString text = QInputDialog::getText(this, QStringLiteral("Переименовать проект"),
+                                               QStringLiteral("Название проекта:"), QLineEdit::Normal,
+                                               info->name, &ok).trimmed();
+    if (ok && !text.isEmpty())
+        hub.setName(projectId, text);
 }
 
 void EditorWindow::showNotYet()

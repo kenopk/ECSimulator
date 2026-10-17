@@ -30,6 +30,9 @@ public:
     void tickFlow(qreal dt);
     void clearElectricalState();
 
+signals:
+    void topologyChanged();                    // изменилась схема (геометрия, состав): можно перепроверить правила
+
 protected:
     void drawBackground(QPainter *painter, const QRectF &rect) override;
     void drawForeground(QPainter *painter, const QRectF &rect) override;

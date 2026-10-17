@@ -29,6 +29,7 @@ struct ChipGeom {
     bool glyph = false;    // заголовок вида "@имя" — особый рисунок вместо надписи
     bool module = false;   // «модуль»: рисуется сам модуль без корпуса-обёртки
     unsigned variant = 0;
+    bool ok = false;       // раскладка разобрана (у карты Карно без выводов список выводов пуст)
     std::vector<PinPos> pp;
 };
 
@@ -52,34 +53,93 @@ qreal pinSlot(int j, int n, qreal pitch)
 
 qreal ceil16(qreal v) { return std::ceil(v / 16.0 - 1e-9) * 16.0; }
 
+// Расстояние между разрядами сегментного индикатора (с десятичной точкой и зазором).
+int segCount(const std::string &title)                     // «@seg14» → 14
+{
+    return std::atoi(title.c_str() + 4);
+}
+
+qreal segDigitPitch(const std::string &title)
+{
+    switch (segCount(title)) {
+    case 3:  return 44.0;
+    case 5:  return 56.0;
+    case 14:
+    case 16: return 76.0;
+    default: return 60.0;
+    }
+}
+
+// Размеры карты Карно как элемента схемы (в единицах сцены): таблица с подписями Грея и окно с формулой под ней.
+struct KmapGeom {
+    int cols = 4, rows = 4, colBits = 2, rowBits = 2;
+    qreal cell = 30, cellW = 30, labelW = 40, headH = 26, mapW = 160, mapH = 146, gap = 8, boxH = 46, totalW = 160, totalH = 200;
+    qreal mx0 = 0, my0 = 0;                    // левый верхний угол клеток относительно центра символа
+};
+
+KmapGeom kmapGeom(unsigned variant)
+{
+    KmapGeom k;
+    k.cols = std::clamp(int(variant & 0xFF), 1, 16);
+    k.rows = std::clamp(int((variant >> 8) & 0xFF), 1, 16);
+    k.colBits = Karnaugh::bitsFor(k.cols);
+    k.rowBits = Karnaugh::bitsFor(k.rows);
+    const int mx = std::max(k.cols, k.rows);
+    k.cell = mx <= 4 ? 30.0 : mx <= 8 ? 24.0 : 18.0;
+    k.cellW = std::max(k.cell, (120.0 - k.labelW) / k.cols);    // у узкой карты клетки шире, чтобы таблица занимала всю ширину окна
+    k.mapW = k.labelW + k.cols * k.cellW;
+    k.mapH = k.headH + k.rows * k.cell;
+    k.totalW = k.mapW;
+    k.totalH = k.mapH + k.gap + k.boxH;
+    k.mx0 = -k.mapW / 2.0 + k.labelW;
+    k.my0 = -k.totalH / 2.0 + k.headH;
+    return k;
+}
+
 const ChipGeom *chipGeom(ElementType t, unsigned variant)
 {
     static std::map<std::pair<int, unsigned>, ChipGeom> cache;
     const auto key = std::make_pair(int(t), variant);
     auto it = cache.find(key);
     if (it != cache.end())
-        return it->second.layout.pins.empty() ? nullptr : &it->second;
+        return it->second.ok ? &it->second : nullptr;
 
     ChipGeom g;
     g.variant = variant;
     const ElementInfo &info = elementInfo(t);
     if (info.chip) {
+        g.ok = true;
         g.layout = govno::core::layoutFor(info, variant);
         const auto &lay = g.layout;
         const int nl = lay.leftCount, nr = lay.rightCount, nt = lay.topCount, nb = lay.bottomCount;
         const std::string &ti = lay.title;
         g.glyph = !ti.empty() && ti[0] == '@';
         const bool lcd = ti == "@lcd", keypad = ti == "@keypad", dip = ti == "@dip", ledm = ti == "@ledm";
-        g.module = lcd || keypad || dip || ledm;
+        const bool seg = ti.compare(0, 4, "@seg") == 0;
+        const bool kmap = ti == "@kmap";
+        g.module = lcd || keypad || dip || ledm || seg || kmap;
 
         // шаги выводов
-        if (ledm || lcd) {
+        if (ledm || lcd || seg || kmap) {
             g.pitchS = g.pitchT = 16.0;
+            if (seg) {                                       // широкий многоразрядный корпус — выводы реже, по всей ширине
+                const int digits = std::max(1, int((variant >> 8) & 0xFF));
+                if (digits > 1 && (std::max(nt, nb) - 1) * 32.0 + 24.0 <= digits * segDigitPitch(ti))
+                    g.pitchT = 32.0;
+            }
         } else if (keypad) {
             const int r = int(variant & 0xFF), c = int((variant >> 8) & 0xFF);
             g.pitchS = g.pitchT = std::max(r, c) <= 8 ? 32.0 : 16.0;
         } else if (dip) {
             g.pitchT = int(variant) <= 8 ? 32.0 : 16.0;
+        }
+
+        // Много выводов на одной стороне — выводы идут через клетку (шаг 16 вместо 32), иначе корпус растёт в колонну.
+        if (!g.module) {
+            if (std::max(nl, nr) > 6)
+                g.pitchS = 16.0;
+            if (std::max(nt, nb) > 6)
+                g.pitchT = 16.0;
         }
 
         // длина самых длинных имён по сторонам
@@ -100,14 +160,48 @@ const ChipGeom *chipGeom(ElementType t, unsigned variant)
         if (dip) xs3 = xs2;                                  // у DIP обе стороны выровнены по переключателям
 
         if (g.module) {
-            if (ledm || keypad) {
+            if (ledm) {
+                // Как реальный модуль: тёмный корпус с рядами круглых светодиодов, выводы сверху и снизу.
+                const int rows = int(variant & 0xFF), cols = int((variant >> 8) & 0xFF);
+                qreal lo = pinSlot(0, cols, 16.0), hi = pinSlot(cols - 1, cols, 16.0);
+                for (const auto *xs : { &xs2, &xs3 })
+                    if (!xs->empty()) {
+                        lo = std::min(lo, xs->front());
+                        hi = std::max(hi, xs->back());
+                    }
+                g.rx0 = lo - 12.0;
+                g.rx1 = hi + 12.0;
+                g.ry0 = pinSlot(0, rows, 16.0) - 12.0;
+                g.ry1 = pinSlot(rows - 1, rows, 16.0) + 12.0;
+            } else if (keypad) {
                 const qreal pc = g.pitchT;
-                const qreal hw = ledm ? 8.0 : pc / 2.0;
-                const qreal hh = ledm ? 8.0 : g.pitchS / 2.0;
+                const qreal hw = pc / 2.0;
+                const qreal hh = g.pitchS / 2.0;
                 g.rx0 = (xs2.empty() ? -hw : xs2.front() - hw);
                 g.rx1 = (xs2.empty() ? hw : xs2.back() + hw);
                 g.ry0 = (ys0.empty() ? -hh : ys0.front() - hh);
                 g.ry1 = (ys0.empty() ? hh : ys0.back() + hh);
+            } else if (kmap) {
+                const KmapGeom k = kmapGeom(variant);
+                g.rx0 = -k.totalW / 2.0;
+                g.rx1 = k.totalW / 2.0;
+                g.ry0 = -k.totalH / 2.0;
+                g.ry1 = k.totalH / 2.0;
+            } else if (seg) {
+                // Корпус индикатора: цифра с точкой и поля, но не уже ряда выводов; высота — по цифре.
+                const int digits = std::max(1, int((variant >> 8) & 0xFF));
+                const qreal dw = digits == 1 ? (segCount(ti) >= 14 ? 40.0 : 26.0)
+                                             : digits * segDigitPitch(ti) / 2.0 + 10.0;
+                qreal lo = -dw, hi = dw;
+                for (const auto *xs : { &xs2, &xs3 })
+                    if (!xs->empty()) {
+                        lo = std::min(lo, xs->front() - 10.0);
+                        hi = std::max(hi, xs->back() + 10.0);
+                    }
+                g.rx0 = lo;
+                g.rx1 = hi;
+                g.ry0 = -48.0;
+                g.ry1 = 48.0;
             } else if (dip) {
                 g.rx0 = (xs2.empty() ? 0.0 : xs2.front()) - g.pitchT / 2.0;
                 g.rx1 = (xs2.empty() ? 0.0 : xs2.back()) + g.pitchT / 2.0;
@@ -134,10 +228,14 @@ const ChipGeom *chipGeom(ElementType t, unsigned variant)
             if (nt > 1) need = std::max(need, (nt - 1) * g.pitchT + 44.0);
             if (nb > 1) need = std::max(need, (nb - 1) * g.pitchT + 44.0);
             if (nt == 1 || nb == 1) need = std::max(need, 56.0);
+            if (ti == "INSTR")
+                need = std::max(need, 176.0);                // место под экран с мнемоникой
             if (g.glyph) {
                 qreal minW = 80.0;
-                if (ti == "@relay" || ti.compare(0, 4, "@seg") == 0)
+                if (ti == "@relay")
                     minW = 96.0;
+                else if (ti.compare(0, 4, "@seg") == 0)
+                    minW = 64.0;
                 else if (ti == "@dmat")
                     minW = 36.0 + nr * 12.0 + maxL + maxR;
                 else if (ti == "@xsw")
@@ -147,9 +245,12 @@ const ChipGeom *chipGeom(ElementType t, unsigned variant)
                 need = std::max(need, minW);
             }
             g.w = std::max<qreal>(48.0, std::ceil(need / 16.0) * 16.0);
-            g.H = std::max(rows * 16.0 + 10.0, g.glyph ? 58.0 : 26.0);
+            const bool dense = g.pitchS < 32.0;
+            g.H = std::max(rows * g.pitchS / 2.0 + 10.0 + (dense && !g.glyph ? 14.0 : 0.0), g.glyph ? 58.0 : 26.0);
+            if (ti.compare(0, 4, "@seg") == 0)
+                g.H = 48.0;                                  // цифра невысокая: корпус по её высоте, выводы — по сторонам
             if (nt > 0 || nb > 0)
-                g.H = ceil16(g.H + 12.0);
+                g.H = ceil16(g.H + (ti.compare(0, 4, "@seg") == 0 ? 0.0 : 12.0));
             g.rx0 = -g.w / 2.0;
             g.rx1 = g.w / 2.0;
             g.ry0 = -g.H;
@@ -205,7 +306,7 @@ const ChipGeom *chipGeom(ElementType t, unsigned variant)
         g.spec = s;
     }
     auto res = cache.emplace(key, std::move(g));
-    return res.first->second.layout.pins.empty() ? nullptr : &res.first->second;
+    return res.first->second.ok ? &res.first->second : nullptr;
 }
 
 
@@ -218,7 +319,8 @@ void chipText(const Ctx &c, const P &pos, const QString &s, qreal px, int align,
     p->translate(pos);
     p->scale(1.0, c.flip ? -1.0 : 1.0);
     p->rotate(-c.angle);
-    QFont f(QStringLiteral("Segoe UI"));
+    QFont f;
+    f.setFamilies(Theme::uiFamilies());
     f.setPixelSize(std::max(1, int(px * c.textScale)));
     f.setBold(bold);
     p->setFont(f);
@@ -240,6 +342,123 @@ void chipText(const Ctx &c, const P &pos, const QString &s, qreal px, int align,
 }
 
 void chipGlyph(const Ctx &c, const ChipGeom &g, qreal cx);
+void segmentDigit(const Ctx &c, int n, qreal cx, int lightOffset = 0)   // n — число сегментов: 3, 5, 7, 9, 14, 16
+{
+    // Все цифры собраны из одних и тех же «ячеек» — вытянутых шестиугольников, как у реальных индикаторов:
+    //   3  — b, c, g: цифра «1» и знак «минус»;
+    //   5  — a, b, c, d, g: несколько цифр (1, 3, 7) и знаки;
+    //   7  — a…g: все цифры;
+    //   9  — семь и две диагонали h, i (верхняя правая и нижняя левая): красивее «3» и «7»;
+    //   14 — «звезда»: верх и низ целиком, середина пополам g1, g2, внутри h, j, k, l, m, n;
+    //   16 — то же, но верх и низ тоже пополам: a1, a2, d1, d2; внутри h, i, j, k, l, m.
+    // Порядок ячеек совпадает с порядком имён выводов, затем десятичная точка (у 3 сегментов её нет).
+    QPainter *p = c.p;
+    const qreal k = 1.5;
+    p->save();
+    p->translate(cx, 0);
+    p->scale(k, k);
+
+    struct Bar { qreal x0, y0, x1, y1, ht; };
+    std::vector<Bar> bars;
+    // У 14 и 16 сегментов цифра шире: в центре хватает места для диагоналей и вертикалей.
+    const bool wide = n >= 14;
+    const qreal w = wide ? 14.0 : 10.0, h = 18.0, tip = w - 2.5, vin = 1.5;
+    const qreal di = wide ? 4.0 : 2.8;                       // докуда диагонали и вертикали доходят к центру
+    auto H = [&](qreal xa, qreal xb, qreal y) { bars.push_back({ xa, y, xb, y, 2.1 }); };
+    auto V = [&](qreal x, qreal ya, qreal yb) { bars.push_back({ x, ya, x, yb, 2.1 }); };
+    auto D = [&](qreal xa, qreal ya, qreal xb, qreal yb) { bars.push_back({ xa, ya, xb, yb, 1.7 }); };
+    auto bSeg = [&]() { V(w, -h + 1.5, -vin); };
+    auto cSeg = [&]() { V(w, vin, h - 1.5); };
+
+    if (n == 3) {
+        bSeg(); cSeg();                                     // b, c
+        H(-tip, tip, 0);                                    // g
+    } else if (n == 5) {
+        H(-tip, tip, -h);                                   // a
+        bSeg(); cSeg();                                     // b, c
+        H(-tip, tip, h);                                    // d
+        H(-tip, tip, 0);                                    // g
+    } else if (n == 7 || n == 9) {
+        H(-tip, tip, -h);                                   // a
+        bSeg(); cSeg();                                     // b, c
+        H(-tip, tip, h);                                    // d
+        V(-w, vin, h - 1.5);                                // e
+        V(-w, -h + 1.5, -vin);                              // f
+        H(-tip, tip, 0);                                    // g
+        if (n == 9) {
+            D(6.6, -14.5, 1.7, -3.74);                      // h  (правая верхняя диагональ)
+            D(-1.7, 3.74, -6.6, 14.5);                      // i  (левая нижняя диагональ, продолжает h через центр)
+        }
+    } else if (n == 14) {
+        H(-tip, tip, -h);                                   // a
+        bSeg(); cSeg();                                     // b, c
+        H(-tip, tip, h);                                    // d
+        V(-w, vin, h - 1.5);                                // e
+        V(-w, -h + 1.5, -vin);                              // f
+        H(-tip, -1.3, 0);                                   // g1
+        H(1.3, tip, 0);                                     // g2
+        D(-tip, -h + 3.0, -di, -3.0);                       // h  (левая верхняя диагональ)
+        V(0, -h + 3.0, -di);                                // j  (верхняя вертикаль)
+        D(tip, -h + 3.0, di, -3.0);                         // k  (правая верхняя диагональ)
+        D(tip, h - 3.0, di, 3.0);                           // l  (правая нижняя диагональ)
+        V(0, di, h - 3.0);                                  // m  (нижняя вертикаль)
+        D(-tip, h - 3.0, -di, 3.0);                         // n  (левая нижняя диагональ)
+    } else {                                                // 16
+        H(-tip, -1.3, -h);  H(1.3, tip, -h);                // a1, a2
+        bSeg(); cSeg();                                     // b, c
+        H(-tip, -1.3, h);   H(1.3, tip, h);                 // d1, d2
+        V(-w, vin, h - 1.5);                                // e
+        V(-w, -h + 1.5, -vin);                              // f
+        H(-tip, -1.3, 0);   H(1.3, tip, 0);                 // g1, g2
+        D(-tip, -h + 3.0, -di, -3.0);                       // h
+        V(0, -h + 3.0, -di);                                // i
+        D(tip, -h + 3.0, di, -3.0);                         // j
+        D(tip, h - 3.0, di, 3.0);                           // k
+        V(0, di, h - 3.0);                                  // l
+        D(-tip, h - 3.0, -di, 3.0);                         // m
+    }
+
+    auto barPoly = [&](const Bar &b) {
+        const P a(b.x0, b.y0), z(b.x1, b.y1);
+        const P d = z - a;
+        const qreal len = std::hypot(d.x(), d.y());
+        const P u(d.x() / len, d.y() / len);
+        const P nn(-u.y(), u.x());
+        const qreal t = b.ht;
+        QPolygonF poly;
+        poly << a << a + u * t + nn * t << z - u * t + nn * t << z << z - u * t - nn * t << a + u * t - nn * t;
+        return poly;
+    };
+
+    for (std::size_t i = 0; i < bars.size(); ++i) {
+        const int li = lightOffset + int(i);
+        const double lv = li < c.light.size() ? c.light[li] : 0.0;
+        const bool lit = lv > 0.02 && c.glow.isValid();
+        QColor fill = c.body;
+        fill.setAlpha(36);
+        if (lit) {
+            fill = c.glow;
+            fill.setAlphaF(std::min(1.0, 0.35 + 0.65 * lv));
+        }
+        QColor edge = lit ? c.glow : c.body;
+        edge.setAlpha(lit ? 255 : 90);
+        p->setPen(QPen(edge, 0.7 / k));
+        p->setBrush(fill);
+        p->drawPolygon(barPoly(bars[i]));
+    }
+
+    if (n != 3) {                                           // десятичная точка идёт последней
+        const int dpIndex = lightOffset + int(bars.size());
+        const bool dpOn = dpIndex < c.light.size() && c.light[dpIndex] > 0.02 && c.glow.isValid();
+        QColor dot = dpOn ? c.glow : c.body;
+        if (!dpOn)
+            dot.setAlpha(36);
+        p->setPen(QPen(dpOn ? c.glow : QColor(c.body.red(), c.body.green(), c.body.blue(), 90), 0.7 / k));
+        p->setBrush(dot);
+        p->drawEllipse(P(w + 6.5, h + 1.0), 2.0, 2.0);
+    }
+    p->restore();
+}
 
 // Перевод вектора «на экране» в локальные координаты символа (с учётом поворота и отражения).
 P screenToLocal(const Ctx &c, qreal sx, qreal sy)
@@ -267,7 +486,8 @@ void chipTextRot(const Ctx &c, const P &pos, const QString &s, qreal px)
     p->scale(1.0, c.flip ? -1.0 : 1.0);
     p->rotate(-c.angle);
     p->rotate(-90.0);
-    QFont f(QStringLiteral("Segoe UI"));
+    QFont f;
+    f.setFamilies(Theme::uiFamilies());
     f.setPixelSize(std::max(1, int(px * c.textScale)));
     p->setFont(f);
     p->setPen(c.body);
@@ -301,10 +521,112 @@ void leadName(const Ctx &c, const P &S, const P &E, const QString &name, qreal p
 }
 
 // Рисунок модулей (ЖК-дисплей, клавиатура, DIP-переключатель, матрица светодиодов): без корпуса-обёртки.
+// Надпись с переносом по словам, не поворачивающаяся вместе с элементом (окно с формулой карты Карно).
+void wrappedText(const Ctx &c, const QRectF &rect, const QString &s, qreal px, bool bold)
+{
+    QPainter *p = c.p;
+    p->save();
+    p->translate(rect.center());
+    p->scale(1.0, c.flip ? -1.0 : 1.0);
+    p->rotate(-c.angle);
+    QFont f;
+    f.setFamilies(Theme::monoFamilies());
+    f.setPixelSize(std::max(1, int(px * c.textScale)));
+    f.setBold(bold);
+    p->setFont(f);
+    p->setPen(c.body);
+    p->drawText(QRectF(-rect.width() / 2.0, -rect.height() / 2.0, rect.width(), rect.height()),
+                Qt::AlignCenter | Qt::TextWrapAnywhere, s);
+    p->restore();
+}
+
+// Карта Карно как элемент схемы: таблица 0 / 1 / X с подписями Грея, диагональ с именами переменных в углу
+// и окно «F = формула» (СДНФ, СКНФ, минимальная ДНФ или КНФ — по параметру элемента).
+void paintKarnaugh(const Ctx &c, const ChipGeom &g, qreal cx)
+{
+    QPainter *p = c.p;
+    const KmapGeom k = kmapGeom(g.variant);
+    const QStringList names = Karnaugh::variableNames(k.rowBits + k.colBits);
+    QString rowNames, colNames;
+    for (int i = 0; i < k.rowBits; ++i)
+        rowNames += names.value(i);
+    for (int i = 0; i < k.colBits; ++i)
+        colNames += names.value(k.rowBits + i);
+
+    const qreal x0 = cx + k.mx0, y0 = k.my0;
+    const qreal xl = x0 - k.labelW, yt = y0 - k.headH;       // левый верхний угол всей таблицы
+    const qreal w = k.cols * k.cellW, h = k.rows * k.cell;
+    auto tone = [&](int alpha) { QColor col = c.body; col.setAlpha(alpha); return col; };
+
+    // подписи — тёмные ячейки по верху и левому краю, как на sublime.tools
+    p->setPen(Qt::NoPen);
+    p->setBrush(tone(34));
+    p->drawRect(QRectF(xl, yt, k.labelW + w, k.headH));
+    p->drawRect(QRectF(xl, y0, k.labelW, h));
+    p->setBrush(tone(12));
+    p->drawRect(QRectF(x0, y0, w, h));
+
+    p->setPen(QPen(tone(100), 0.7));
+    p->setBrush(Qt::NoBrush);
+    for (int i = 0; i <= k.cols; ++i)
+        p->drawLine(QPointF(x0 + i * k.cellW, yt), QPointF(x0 + i * k.cellW, y0 + h));
+    for (int j = 0; j <= k.rows; ++j)
+        p->drawLine(QPointF(xl, y0 + j * k.cell), QPointF(x0 + w, y0 + j * k.cell));
+    p->drawLine(QPointF(xl, yt), QPointF(x0, y0));            // диагональ угла
+    p->setPen(penFor(c, c.body, 1.0));
+    p->drawRoundedRect(QRectF(xl, yt, k.labelW + w, k.headH + h), 3, 3);
+
+    const qreal labelPx = k.cell >= 24 ? 9.0 : 6.6;
+    for (int i = 0; i < k.cols; ++i)
+        chipText(c, P(x0 + (i + 0.5) * k.cellW, yt + k.headH * 0.5 + 3.0), Karnaugh::grayLabel(i, k.colBits), labelPx, 0, false, true);
+    for (int j = 0; j < k.rows; ++j)
+        chipText(c, P(xl + k.labelW * 0.5, y0 + (j + 0.5) * k.cell), Karnaugh::grayLabel(j, k.rowBits), labelPx, 0, false, true);
+    if (!colNames.isEmpty())
+        chipText(c, P(x0 - 3.0, yt + 7.0), colNames, 8.0, 1, false, true);
+    if (!rowNames.isEmpty())
+        chipText(c, P(xl + 3.0, y0 - 7.0), rowNames, 8.0, -1, false, true);
+
+    Ctx dim = c;
+    dim.body = tone(120);
+    Ctx accent = c;
+    accent.body = tone(255);
+    const qreal valuePx = k.cell * 0.5;
+    for (int j = 0; j < k.rows; ++j)
+        for (int i = 0; i < k.cols; ++i) {
+            const int idx = j * 16 + i;
+            const quint8 v = idx < c.cells.size() ? c.cells[idx] : 0;
+            const P centre(x0 + (i + 0.5) * k.cellW, y0 + (j + 0.5) * k.cell);
+            if (v == 1) {
+                p->setPen(Qt::NoPen);
+                p->setBrush(tone(46));
+                p->drawRect(QRectF(x0 + i * k.cellW + 0.5, y0 + j * k.cell + 0.5, k.cellW - 1.0, k.cell - 1.0));
+            }
+            chipText(v == 1 ? accent : dim, centre, v == 1 ? QStringLiteral("1") : v == 2 ? QStringLiteral("X") : QStringLiteral("0"),
+                     valuePx, 0, false, true);
+        }
+
+    // окно с результатом
+    const QRectF box(cx - k.totalW / 2.0, -k.totalH / 2.0 + k.mapH + k.gap, k.totalW, k.boxH);
+    p->setPen(penFor(c, c.body, 0.8));
+    p->setBrush(tone(14));
+    p->drawRoundedRect(box, 4, 4);
+    p->setBrush(Qt::NoBrush);
+    QString formula = c.result.isEmpty() ? QStringLiteral("0") : c.result;
+    const qreal fpx = 10.0;
+    const int cap = std::max(6, int(3.0 * (box.width() - 10.0) / (fpx * 0.6)));
+    if (formula.size() > cap - 4)
+        formula = formula.left(cap - 8) + QStringLiteral("…");
+    wrappedText(c, box.adjusted(5, 2, -5, -2), QStringLiteral("F = ") + formula, fpx, true);
+}
+
 void paintModuleArt(const Ctx &c, const ChipGeom &g, qreal cx)
 {
     QPainter *p = c.p;
     const std::string &ti = g.layout.title;
+    if (ti == "@kmap") {
+        paintKarnaugh(c, g, cx);
+        return;
+    }
     std::vector<qreal> ys, xs;
     for (const PinPos &pp : g.pp) {
         if (pp.edge == 0)
@@ -315,6 +637,23 @@ void paintModuleArt(const Ctx &c, const ChipGeom &g, qreal cx)
     QColor faint = c.body;
     faint.setAlpha(70);
     setBody(c, 0.8);
+
+    if (ti.compare(0, 4, "@seg") == 0) {                     // корпус индикатора со стеклом и цифрой внутри
+        const int n = segCount(ti);
+        setBody(c, 1.0);
+        QColor glass = c.body;
+        glass.setAlpha(14);
+        c.p->setBrush(glass);
+        c.p->drawRoundedRect(QRectF(cx + g.rx0, g.ry0, g.rx1 - g.rx0, g.ry1 - g.ry0), 4, 4);
+        c.p->setBrush(Qt::NoBrush);
+        const int digits = std::max(1, int((g.variant >> 8) & 0xFF));
+        const int perDigit = n + (n != 3 ? 1 : 0);            // ячейки цифры и десятичная точка (у 3 сегментов её нет)
+        const qreal pitch = segDigitPitch(ti);
+        const qreal mid = cx + (g.rx0 + g.rx1) / 2.0;          // середина корпуса: выводы могут стоять со сдвигом на полшага
+        for (int d = 0; d < digits; ++d)                     // цифры подряд; у каждой свои уровни: ячейки и точка
+            segmentDigit(c, n, mid + (d - (digits - 1) / 2.0) * pitch, d * perDigit);
+        return;
+    }
 
     if (ti == "@lcd") {
         int cc = 16, rr = 2;
@@ -327,7 +666,7 @@ void paintModuleArt(const Ctx &c, const ChipGeom &g, qreal cx)
         const qreal cw = 14.0;
         const qreal ch = (g.ry1 - g.ry0 - 16.0) / rr;
         const qreal xs0 = cx - cc * cw / 2.0;
-        static const char *kText[4] = { "Hello, World!", "GOVNO circuits", "0123456789ABCDEF", "The quick brown fox" };
+        const QStringList lines = c.readout.split(QLatin1Char('\n'));   // строки экрана приходят от ядра (setReadout)
         for (int r = 0; r < rr; ++r)
             for (int k = 0; k < cc; ++k) {
                 const qreal x = xs0 + k * cw;
@@ -337,9 +676,9 @@ void paintModuleArt(const Ctx &c, const ChipGeom &g, qreal cx)
                 cell.setAlpha(on ? 28 : 8);
                 p->setBrush(cell);
                 p->drawRect(QRectF(x + 0.8, y + 1.0, cw - 1.6, ch - 2.0));
-                const char *s = kText[r % 4];
-                if (on && k < int(std::strlen(s)) && s[k] != ' ')
-                    chipText(c, P(x + cw / 2.0, y + ch / 2.0), QString(QChar(s[k])), 12.0, 0, false, true);
+                const QString line = r < lines.size() ? lines[r] : QString();
+                if (on && k < line.size() && line[k] != QLatin1Char(' '))
+                    chipText(c, P(x + cw / 2.0, y + ch / 2.0), QString(line[k]), 12.0, 0, false, true);
             }
         p->setBrush(Qt::NoBrush);
     } else if (ti == "@keypad") {
@@ -378,21 +717,56 @@ void paintModuleArt(const Ctx &c, const ChipGeom &g, qreal cx)
             p->drawRoundedRect(QRectF(x - tw / 2.0, on ? g.ry0 : mid, tw, (g.ry1 - g.ry0) / 2.0), 3, 3);
         }
         p->setBrush(Qt::NoBrush);
-    } else if (ti == "@ledm") {                              // светодиоды на пересечениях строк и столбцов
-        p->setPen(QPen(faint, std::max<qreal>(0.5, c.width * 0.3)));
-        for (qreal y : ys)
-            p->drawLine(P(cx + g.rx0 + 2.0, y), P(cx + g.rx1 - 2.0, y));
-        for (qreal x : xs)
-            p->drawLine(P(cx + x, g.ry0 + 2.0), P(cx + x, g.ry1 - 2.0));
-        p->setPen(penFor(c, c.body, 0.6));
-        QColor led = c.body;
-        led.setAlpha(40);
-        p->setBrush(led);
-        for (qreal y : ys)
-            for (qreal x : xs)
-                p->drawEllipse(P(cx + x, y), 4.6, 4.6);
+    } else if (ti == "@ledm") {                              // тёмный корпус и круглые светодиоды, как у реального модуля
+        const int rows = int(g.variant & 0xFF), cols = int((g.variant >> 8) & 0xFF);
+        setBody(c, 1.0);
+        QColor shell = c.body;
+        shell.setAlpha(22);
+        p->setBrush(shell);
+        p->drawRoundedRect(QRectF(cx + g.rx0, g.ry0, g.rx1 - g.rx0, g.ry1 - g.ry0), 3, 3);
+        QColor off = c.body;
+        off.setAlpha(46);
+        QColor offEdge = c.body;
+        offEdge.setAlpha(110);
+        const qreal r = 5.6;
+        for (int i = 0; i < rows; ++i) {
+            const qreal y = pinSlot(i, rows, 16.0);
+            for (int j = 0; j < cols; ++j) {
+                const qreal x = cx + pinSlot(j, cols, 16.0);
+                const int idx = i * cols + j;                  // ячейки идут по строкам
+                const double lv = idx < c.light.size() ? c.light[idx] : 0.0;
+                if (lv > 0.02 && c.glow.isValid()) {            // горит: цвет свечения, яркость — по уровню
+                    QColor on = c.glow;
+                    on.setAlphaF(std::min(1.0, 0.3 + 0.7 * lv));
+                    p->setPen(QPen(c.glow, 0.8));
+                    p->setBrush(on);
+                } else {
+                    p->setPen(QPen(offEdge, 0.8));
+                    p->setBrush(off);
+                }
+                p->drawEllipse(P(x, y), r, r);
+            }
+        }
         p->setBrush(Qt::NoBrush);
     }
+}
+
+// Экран дисплея инструкций: в первой строке мнемоника команды, во второй — код (приходят от ядра через setReadout).
+void paintInstrScreen(const Ctx &c, const ChipGeom &g, qreal cx)
+{
+    const QRectF r(cx + g.rx0 + 40.0, g.ry0 + 24.0, g.rx1 - g.rx0 - 48.0, g.ry1 - g.ry0 - 32.0);
+    QColor fill = c.body;
+    fill.setAlpha(18);
+    c.p->setPen(QPen(QColor(c.body.red(), c.body.green(), c.body.blue(), 90), 0.8));
+    c.p->setBrush(fill);
+    c.p->drawRoundedRect(r, 3, 3);
+    c.p->setBrush(Qt::NoBrush);
+    const QStringList lines = c.readout.split(QLatin1Char('\n'));
+    const bool live = !c.readout.isEmpty();
+    const QString top = live ? lines.value(0) : QStringLiteral("----");
+    chipText(c, P(r.center().x(), r.center().y() - (live && lines.size() > 1 ? 9.0 : 0.0)), top, 15.0, 0, false, true);
+    if (live && lines.size() > 1)
+        chipText(c, P(r.center().x(), r.center().y() + 13.0), lines.value(1), 10.0, 0, false, false);
 }
 
 void paintChip(const Ctx &c, const ChipGeom &g)
@@ -406,7 +780,7 @@ void paintChip(const Ctx &c, const ChipGeom &g)
 
     const qreal ca = std::cos(c.angle * kPi / 180.0);
     const bool vertical = std::fabs(ca) < 0.5;
-    const qreal px = g.module ? 8.5 : (vertical ? 8.0 : 11.0);
+    const qreal px = g.module ? 8.5 : g.pitchS < 32.0 ? (vertical ? 7.5 : 9.5) : (vertical ? 8.0 : 11.0);
 
     const int n = int(std::min<std::size_t>(g.layout.pins.size(), kMaxPins));
     for (int i = 0; i < n; ++i) {
@@ -435,6 +809,7 @@ void paintChip(const Ctx &c, const ChipGeom &g)
         c.p->drawRect(QRectF(x0, y0, x1 - x0, y1 - y0));
     }
 
+    int topIdx = 0, botIdx = 0;                              // номер вывода на стороне — для шахматного смещения подписей
     for (int i = 0; i < n; ++i) {
         const auto &pin = g.layout.pins[std::size_t(i)];
         const PinPos &pp = g.pp[std::size_t(i)];
@@ -452,8 +827,11 @@ void paintChip(const Ctx &c, const ChipGeom &g)
             continue;
         }
         if (pp.edge >= 2) {
+            const int k = pp.edge == 2 ? topIdx++ : botIdx++;
+            // Подписи плотных выводов (шаг 16) чередуются по высоте: соседние не сливаются.
+            const qreal drop = (g.pitchT < 32.0 && (k % 2) == 1) ? 11.0 : 0.0;
             if (!name.isEmpty())
-                chipText(c, P(cx + pp.dx, pp.edge == 2 ? y0 + 9.0 : y1 - 9.0), name, px, 0, pin.inverted, false);
+                chipText(c, P(cx + pp.dx, pp.edge == 2 ? y0 + 9.0 + drop : y1 - 9.0 - drop), name, px, 0, pin.inverted, false);
             continue;
         }
         const bool left = pp.edge == 0;
@@ -484,8 +862,10 @@ void paintChip(const Ctx &c, const ChipGeom &g)
     } else if (g.glyph) {
         chipGlyph(c, g, cx);
     } else {
-        const qreal ty = y0 + (g.layout.topCount > 0 ? 24.0 : 9.0);
+        const qreal ty = y0 + (g.layout.topCount > 0 ? 31.0 : 9.0);
         chipText(c, P(cx, ty), QString::fromStdString(g.layout.title), vertical ? 9.0 : 12.0, 0, false, true);
+        if (g.layout.title == "INSTR")
+            paintInstrScreen(c, g, cx);
     }
 }
 
@@ -500,6 +880,13 @@ int partAtImpl(const ChipGeom &g, qreal length, const P &pt)
             ys.push_back(pp.y);
         else if (pp.edge == 2)
             xs.push_back(pp.dx);
+    }
+    if (ti == "@kmap") {                                     // клетки таблицы: номер = строка × число столбцов + столбец + 1
+        const KmapGeom k = kmapGeom(g.variant);
+        const qreal fx = pt.x() - cx - k.mx0, fy = pt.y() - k.my0;
+        if (fx < 0 || fy < 0 || fx >= k.cols * k.cellW || fy >= k.rows * k.cell)
+            return 0;
+        return int(fy / k.cell) * k.cols + int(fx / k.cellW) + 1;
     }
     if (ti == "@keypad") {
         const qreal hp = g.pitchT / 2.0;
@@ -519,44 +906,6 @@ int partAtImpl(const ChipGeom &g, qreal length, const P &pt)
 
 
 // Рисунки внутри корпуса.
-void segmentDigit(const Ctx &c, int kind, qreal cx)       // kind: 0 — 7, 1 — 14, 2 — 16, 3 — 21 сегмент
-{
-    QPainter *p = c.p;
-    const qreal k = kind == 0 ? 1.0 : 1.35;
-    p->save();
-    p->translate(cx, 0);
-    p->scale(k, k);
-    const qreal w = 10, h = 18;
-    p->setPen(penFor(c, c.body, 0.9 / k));
-    p->setBrush(Qt::NoBrush);
-    auto seg = [&](qreal x0, qreal y0, qreal x1, qreal y1) { p->drawLine(P(x0, y0), P(x1, y1)); };
-    if (kind == 0 || kind == 1) {
-        seg(-w + 2, -h, w - 2, -h);
-        seg(-w + 2, h, w - 2, h);
-    } else {                                              // верх и низ разрезаны посередине
-        seg(-w + 2, -h, -1, -h);  seg(1, -h, w - 2, -h);
-        seg(-w + 2, h, -1, h);    seg(1, h, w - 2, h);
-    }
-    seg(w, -h + 2, w, -2);  seg(w, 2, w, h - 2);          // b, c
-    seg(-w, -h + 2, -w, -2); seg(-w, 2, -w, h - 2);       // f, e
-    if (kind == 0) {
-        seg(-w + 2, 0, w - 2, 0);                         // g
-    } else {
-        seg(-w + 2, 0, -1, 0);  seg(1, 0, w - 2, 0);      // g1, g2
-        seg(-w + 3, -h + 3, -2, -3);  seg(w - 3, -h + 3, 2, -3);   // диагонали сверху
-        seg(-w + 3, h - 3, -2, 3);    seg(w - 3, h - 3, 2, 3);     // диагонали снизу
-        seg(0, -h + 2, 0, -2);  seg(0, 2, 0, h - 2);               // вертикали посередине
-    }
-    if (kind == 3) {                                      // дополнительные короткие сегменты
-        seg(-4, -9, 4, -9);  seg(-4, 9, 4, 9);
-        seg(-w - 3, -h, -w - 3, h);  seg(w + 3, -h, w + 3, h);
-        seg(-w + 2, -h - 3, w - 2, -h - 3);
-    }
-    p->setBrush(c.body);
-    p->drawEllipse(P(w + 6, h), 1.6, 1.6);                // десятичная точка
-    p->restore();
-}
-
 void chipGlyph(const Ctx &c, const ChipGeom &g, qreal cx)
 {
     const std::string &name = g.layout.title;
@@ -586,13 +935,11 @@ void chipGlyph(const Ctx &c, const ChipGeom &g, qreal cx)
         line(c, P(cx + 12, 4), P(cx + 22, 11));
         arrowHead(c, P(cx + 22, 11), P(0.77, 0.64), 4.5);
     } else if (name == "@seg7") {
-        segmentDigit(c, 0, cx);
+        segmentDigit(c, 7, cx);
     } else if (name == "@seg14") {
-        segmentDigit(c, 1, cx);
+        segmentDigit(c, 14, cx);
     } else if (name == "@seg16") {
-        segmentDigit(c, 2, cx);
-    } else if (name == "@seg21") {
-        segmentDigit(c, 3, cx);
+        segmentDigit(c, 16, cx);
     } else if (name == "@xsw" || name == "@rcont") {      // перекрёстный переключатель / контакт реле
         const qreal hx = std::max<qreal>(18.0, g.w / 2.0 - 22.0);
         p->setBrush(c.body);
@@ -942,13 +1289,111 @@ void paintScope(const Ctx &c)
     c.p->drawPolyline(w);
 }
 
+// Одна семисегментная цифра (шестиугольные ячейки): mask — какие сегменты горят (бит 0 — a … бит 6 — g), dp — точка.
+void sevenSegGlyph(QPainter *p, qreal cx, qreal cy, qreal k, int mask, bool dp, const QColor &body, const QColor &glow, bool live)
+{
+    struct Seg { qreal x, y; bool horizontal; };
+    static const Seg segs[7] = {
+        { 0, -18, true }, { 10, -9, false }, { 10, 9, false }, { 0, 18, true },
+        { -10, 9, false }, { -10, -9, false }, { 0, 0, true },
+    };
+    p->save();
+    p->translate(cx, cy);
+    p->scale(k, k);
+    const qreal hl = 7.5, ht = 2.1;
+    for (int i = 0; i < 7; ++i) {
+        const bool on = live && ((mask >> i) & 1);
+        QPolygonF poly;
+        const qreal mx = segs[i].x, my = segs[i].y;
+        if (segs[i].horizontal)
+            poly << P(mx - hl, my) << P(mx - hl + ht, my - ht) << P(mx + hl - ht, my - ht)
+                 << P(mx + hl, my) << P(mx + hl - ht, my + ht) << P(mx - hl + ht, my + ht);
+        else
+            poly << P(mx, my - hl) << P(mx + ht, my - hl + ht) << P(mx + ht, my + hl - ht)
+                 << P(mx, my + hl) << P(mx - ht, my + hl - ht) << P(mx - ht, my - hl + ht);
+        QColor fill = on ? glow : body;
+        fill.setAlpha(on ? 235 : 30);
+        QColor edge = on ? glow : body;
+        edge.setAlpha(on ? 255 : 80);
+        p->setPen(QPen(edge, 0.7 / k));
+        p->setBrush(fill);
+        p->drawPolygon(poly);
+    }
+    QColor dot = (live && dp) ? glow : body;
+    dot.setAlpha((live && dp) ? 235 : 30);
+    p->setPen(QPen(dot, 0.7 / k));
+    p->setBrush(dot);
+    p->drawEllipse(P(16.5, 19.0), 2.0, 2.0);
+    p->restore();
+}
+
+// Цифровой индикатор напряжения: корпус со знаками; показание приходит от ядра (CircuitItem::setReadout), например «12.34» или «-5.00».
 void paintDecimalDisplay(const Ctx &c)
 {
-    const Span s = spanOf(c, 36);
+    const qreal bodyW = 84.0, bodyH = 22.0;
+    const Span s = spanOf(c, bodyW);
     twoLeads(c, s);
     setBody(c);
-    c.p->drawRect(QRectF(s.x0, -10, 36, 20));
-    text(c, P(s.cx, 0), QStringLiteral("8.8."), 11);
+    QColor glass = c.body;
+    glass.setAlpha(14);
+    c.p->setBrush(glass);
+    c.p->drawRoundedRect(QRectF(s.x0, -bodyH, bodyW, 2 * bodyH), 3, 3);
+
+    const int n = std::clamp(c.digits > 0 ? c.digits : 4, 1, 8);
+    struct Cell { int mask = 0; bool dp = false; };
+    static const int kMasks[10] = { 0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F };
+    std::vector<Cell> cells;
+    for (const QChar ch : c.readout) {
+        if ((ch == QLatin1Char('.') || ch == QLatin1Char(',')) && !cells.empty())
+            cells.back().dp = true;
+        else if (ch.isDigit())
+            cells.push_back({ kMasks[ch.digitValue()], false });
+        else if (ch == QLatin1Char('-'))
+            cells.push_back({ 0x40, false });
+        else
+            cells.push_back({ 0, false });
+    }
+    const bool live = !c.readout.isEmpty();
+    const qreal pitch = (bodyW - 10.0) / n;
+    const qreal k = std::min(pitch / 30.0, 0.78);
+    const QColor glow = c.glow.isValid() ? c.glow : QColor("#00e676");
+    for (int i = 0; i < n; ++i) {
+        const int src = int(cells.size()) - n + i;           // показание выровнено вправо
+        const Cell cell = src >= 0 ? cells[std::size_t(src)] : Cell();
+        sevenSegGlyph(c.p, s.x0 + 5.0 + pitch * (i + 0.5) - 2.0, 0.0, k, cell.mask, cell.dp, c.body, glow, live);
+    }
+}
+
+// RGB-светодиод: знак светодиода с тремя входами R, G, B (аноды) и общим катодом K.
+void paintLedRgb(const Ctx &c)
+{
+    const qreal L = c.length;
+    const qreal cx = L / 2.0;
+    const qreal xb = cx - 8.0;                              // шина входов; знак (шина + катод) стоит ровно по центру
+    const qreal xt = cx + 8.0;                              // катод (черта)
+    const qreal ys[3] = { -16.0, 0.0, 16.0 };
+    for (int i = 0; i < 3; ++i)
+        lead(c, i, P(0, ys[i]), P(xb, ys[i]));
+    lead(c, 3, P(L, 0), P(xt, 0));
+
+    setBody(c);
+    c.p->drawLine(P(xb, -16.0), P(xb, 16.0));               // шина входов
+    QPolygonF tri;
+    tri << P(xb, -10) << P(xb, 10) << P(xt, 0);
+    c.p->drawPolygon(tri);
+    c.p->drawLine(P(xt, -10), P(xt, 10));                   // катод
+    const P d(0.7071, -0.7071);                             // стрелки света — как у обычного светодиода, над треугольником
+    const P a1(cx - 3, -13);
+    const P a2(cx + 3, -16);
+    line(c, a1, a1 + d * 7.0);
+    arrowHead(c, a1 + d * 11.0, d, 5);
+    line(c, a2, a2 + d * 7.0);
+    arrowHead(c, a2 + d * 11.0, d, 5);
+
+    static const char *kNames[3] = { "R", "G", "B" };       // подписи входов над выводами
+    for (int i = 0; i < 3; ++i)
+        text(c, P(xb / 2.0, ys[i] - 7.0), QString::fromLatin1(kNames[i]), 9, false);
+    text(c, P(xt + (L - xt) / 2.0, -7.0), QStringLiteral("K"), 9, false);
 }
 
 // ----------------------------------------------------- автотрансформатор

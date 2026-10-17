@@ -78,6 +78,7 @@ void CircuitScene::refresh()
     m_refreshQueued = false;
     ensureConnectivity();
     invalidate(QRectF(), QGraphicsScene::ForegroundLayer);
+    emit topologyChanged();
 }
 
 void CircuitScene::ensureConnectivity() const

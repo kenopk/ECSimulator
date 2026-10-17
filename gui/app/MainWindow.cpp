@@ -1,5 +1,6 @@
 #include "app/MainWindow.h"
 
+#include <QFileDialog>
 #include <QIcon>
 #include <QLabel>
 #include <QMessageBox>
@@ -10,6 +11,7 @@
 
 #include "app/EditorWindow.h"
 #include "dialogs/SettingsDialog.h"
+#include "project/ProjectFile.h"
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
@@ -23,6 +25,16 @@ MainWindow::MainWindow(QWidget *parent)
     m_start = buildStartScreen();
     m_stack->addWidget(m_start);
     setCentralWidget(m_stack);
+
+    // имя проекта в заголовке окна
+    auto updateTitle = [this] {
+        const ProjectHub &hub = ProjectHub::instance();
+        const ProjectInfo *p = hub.find(hub.activeId());
+        setWindowTitle(p ? QStringLiteral("%1 — Симулятор электрических цепей").arg(p->name)
+                         : QStringLiteral("Симулятор электрических цепей"));
+    };
+    connect(&ProjectHub::instance(), &ProjectHub::changed, this, updateTitle);
+    updateTitle();
 }
 
 QWidget *MainWindow::buildStartScreen()
@@ -53,15 +65,18 @@ QWidget *MainWindow::buildStartScreen()
         return b;
     };
     auto *create   = makeButton(QStringLiteral("Создать схему"), true);
-    auto *open     = makeButton(QStringLiteral("Открыть схему…"), false);
+    auto *open     = makeButton(QStringLiteral("Открыть проект…"), false);
     auto *settings = makeButton(QStringLiteral("Настройки"), false);
     auto *about    = makeButton(QStringLiteral("О программе"), false);
 
     connect(create, &QPushButton::clicked, this, [this] { showEditor(true); });
     connect(open, &QPushButton::clicked, this, [this] {
-        QMessageBox::information(this, QStringLiteral("Открыть схему"),
-            QStringLiteral("Открытие и сохранение схем появится вместе с ядром симулятора "
-                           "(формат файла описывает ядро)."));
+        const QString path = QFileDialog::getOpenFileName(this, QStringLiteral("Открыть проект"), QString(),
+                                                          QStringLiteral("Проект GOVNO (*.govno)"));
+        if (path.isEmpty())
+            return;
+        showEditor(false);
+        m_editor->openProjectFile(path);
     });
     connect(settings, &QPushButton::clicked, this, [this] {
         SettingsDialog dlg(this);

@@ -9,6 +9,7 @@
 
 class QComboBox;
 class QLineEdit;
+class QPushButton;
 
 // Форма параметров элемента: по одному полю на каждый ParamDef из реестра ядра.
 // Число вводится в поле, а единица измерения стоит справа выпадающим списком
@@ -37,6 +38,10 @@ public:
 signals:
     void valueEdited(const QString &key, double value);
 
+protected:
+    // Колесо мыши над выбранным (с фокусом) числовым полем меняет значение; без фокуса прокручивает панель.
+    bool eventFilter(QObject *obj, QEvent *ev) override;
+
 private:
     struct Field {
         QString key;
@@ -52,9 +57,11 @@ private:
         QLineEdit *edit = nullptr;
         QComboBox *combo = nullptr;      // перечисление
         QComboBox *unitBox = nullptr;    // единица измерения справа
+        QPushButton *colorButton = nullptr;   // параметр-цвет (цвет свечения): кнопка с образцом
     };
 
     void commit(int index);
+    void stepField(int index, int dir);
     void showValue(Field &f, bool autoUnit);
 
     QVector<Field> m_fields;

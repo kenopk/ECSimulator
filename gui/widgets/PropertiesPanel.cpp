@@ -77,13 +77,9 @@ void PropertiesPanel::rebuild()
     m_body = new QWidget(this);
     m_body->setAttribute(Qt::WA_StyledBackground, true);
     auto *lay = new QVBoxLayout(m_body);
-    lay->setContentsMargins(16, 14, 16, 16);
+    lay->setContentsMargins(20, 18, 20, 20);
     lay->setSpacing(12);
     m_root->addWidget(m_body);
-
-    auto *section = new QLabel(QStringLiteral("ЭЛЕМЕНТ"), m_body);
-    section->setObjectName(QStringLiteral("sectionTitle"));
-    lay->addWidget(section);
 
     if (!m_view) {
         showHint(QStringLiteral("Нет открытой схемы."));
