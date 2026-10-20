@@ -129,7 +129,10 @@ void PropertiesPanel::rebuild()
     lay->addWidget(head);
 
     if (!item->hasProperties()) {
-        const QString text = item->isToggle()
+        const QString text = item->isWire()
+            ? QStringLiteral("%1\nДвойной клик по проводу — комментарий (подсказкой при наведении или блоком на схеме) и пометка дифф. пары.")
+                  .arg(item->noteFooter())
+            : item->isToggle()
             ? QStringLiteral("Клик по элементу (или Пробел) — переключить.")
             : QStringLiteral("У этого элемента нет настраиваемых параметров.");
         auto *none = new QLabel(text, m_body);
@@ -170,8 +173,15 @@ void PropertiesPanel::rebuild()
         }
     }
 
-    if (item->hasProperties()) {
-        auto *details = new QPushButton(QStringLiteral("Все характеристики…"), m_body);
+    if (item->isKarnaugh() && !item->link().isEmpty()) {
+        auto *linked = new QLabel(QStringLiteral("Связана с картой Карно «%1»: данные карты видны здесь, правки клеток уходят в карту.")
+                                      .arg(item->link()), m_body);
+        linked->setObjectName(QStringLiteral("hint"));
+        linked->setWordWrap(true);
+        lay->addWidget(linked);
+    }
+    if (item->hasProperties() || item->isWire()) {
+        auto *details = new QPushButton(item->isWire() ? QStringLiteral("Комментарий и дифф. пара…") : QStringLiteral("Все характеристики…"), m_body);
         connect(details, &QPushButton::clicked, this, [this] {
             if (m_item)
                 emit detailsRequested(m_item);

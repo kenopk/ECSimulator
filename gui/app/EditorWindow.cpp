@@ -21,6 +21,7 @@
 #include <QPixmap>
 #include <QPointer>
 #include <QProcess>
+#include <QPushButton>
 #include <QUrl>
 #include <QScrollArea>
 #include <QStackedWidget>
@@ -37,10 +38,13 @@
 #include <QVBoxLayout>
 #include <QWidgetAction>
 
+#include <algorithm>
+
 #include "canvas/CircuitScene.h"
 #include "canvas/CircuitView.h"
 #include "dialogs/ElementDialog.h"
 #include "dialogs/SettingsDialog.h"
+#include "dialogs/WireNoteDialog.h"
 #include "items/CircuitItem.h"
 #include "items/SymbolPainter.h"
 #include "scope/ScopeDialog.h"
@@ -50,8 +54,11 @@
 #include "scope/ScopeMenu.h"
 #include "scope/ScopeWidget.h"
 #include "project/ProjectFile.h"
+#include "pcb/PcbPage.h"
+#include "pcb/PcbToolkitSection.h"
 #include "project/ProjectPanel.h"
 #include "theme/Theme.h"
+#include "tools/KarnaughLinks.h"
 #include "tools/KarnaughSection.h"
 #include "tools/KarnaughWidget.h"
 #include "widgets/PropertiesPanel.h"
@@ -134,6 +141,41 @@ QIcon karnaughIcon(const QColor &color)
         p.setBrush(color);
         p.drawRect(QRectF(margin + cell, margin, cell, cell));
         p.drawRect(QRectF(margin + 2 * cell, margin + cell, cell, cell));
+        p.end();
+        icon.addPixmap(pm);
+    }
+    return icon;
+}
+
+// Значок «печатные платы»: плата с дорожками и контактными площадками.
+QIcon pcbIcon(const QColor &color)
+{
+    QIcon icon;
+    for (int size : { 24, 32, 48 }) {
+        QPixmap pm(size, size);
+        pm.fill(Qt::transparent);
+        QPainter p(&pm);
+        p.setRenderHint(QPainter::Antialiasing);
+        const qreal m = size * 0.14;
+        QPen pen(color, std::max(1.0, size / 22.0));
+        pen.setJoinStyle(Qt::RoundJoin);
+        pen.setCapStyle(Qt::RoundCap);
+        p.setPen(pen);
+        p.setBrush(Qt::NoBrush);
+        p.drawRoundedRect(QRectF(m, m, size - 2 * m, size - 2 * m), size * 0.08, size * 0.08);
+        const qreal u = (size - 2 * m) / 6.0;
+        const QPointF o(m, m);
+        QPainterPath path;                                          // дорожка уголком
+        path.moveTo(o + QPointF(u, 5 * u));
+        path.lineTo(o + QPointF(u, 3 * u));
+        path.lineTo(o + QPointF(3 * u, 3 * u));
+        path.lineTo(o + QPointF(3 * u, u));
+        path.lineTo(o + QPointF(5 * u, u));
+        p.drawPath(path);
+        p.setPen(Qt::NoPen);
+        p.setBrush(color);
+        for (const QPointF &pt : { QPointF(u, 5 * u), QPointF(5 * u, u), QPointF(5 * u, 4 * u) })
+            p.drawEllipse(o + pt, u * 0.5, u * 0.5);
         p.end();
         icon.addPixmap(pm);
     }
@@ -366,6 +408,8 @@ void EditorWindow::buildActions()
     m_closeTabAction = new QAction(QStringLiteral("Закрыть вкладку"), this);
     m_closeTabAction->setShortcut(QKeySequence(QStringLiteral("Ctrl+W")));
     connect(m_closeTabAction, &QAction::triggered, this, [this] {
+        if (m_section == 2)
+            return;                                         // в расчётах печатных плат закрывать нечего
         if (m_stack->currentIndex() == 1)
             m_karnaugh->closeCurrent();
         else
@@ -494,6 +538,9 @@ void EditorWindow::buildActions()
         if (CircuitView *v = currentView()) v->fitToContent();
     });
 
+    m_scaleAction = new QAction(QStringLiteral("Масштаб проводников (мм на клетку)…"), this);
+    connect(m_scaleAction, &QAction::triggered, this, [this] { chooseScale(); });
+
     m_resetViewAction = new QAction(QStringLiteral("100%"), this);
     m_resetViewAction->setShortcut(QKeySequence(QStringLiteral("Ctrl+0")));
     connect(m_resetViewAction, &QAction::triggered, this, [this] {
@@ -516,6 +563,8 @@ void EditorWindow::refreshIcons()
         m_navSimAction->setIcon(elementIcon(ElementType::Resistor, color));
     if (m_navKarnaughAction)
         m_navKarnaughAction->setIcon(karnaughIcon(color));
+    if (m_navPcbAction)
+        m_navPcbAction->setIcon(pcbIcon(color));
 }
 
 void EditorWindow::fillElementMenu(QMenu *menu)
@@ -582,6 +631,8 @@ void EditorWindow::buildMenus()
     m_viewMenu->addAction(m_fitAction);
     m_viewMenu->addAction(m_resetViewAction);
     m_viewMenu->addSeparator();
+    m_viewMenu->addAction(m_scaleAction);
+    m_viewMenu->addSeparator();
     // пункт боковой панели добавляется в buildDock()
 
     QMenu *help = menuBar()->addMenu(QStringLiteral("Справка"));
@@ -618,8 +669,15 @@ void EditorWindow::buildToolBars()
     m_navGroup->addAction(m_navKarnaughAction);
     connect(m_navKarnaughAction, &QAction::triggered, this, [this] { showSection(1); });
 
+    m_navPcbAction = new QAction(QStringLiteral("Печатные\nплаты"), this);
+    m_navPcbAction->setCheckable(true);
+    m_navPcbAction->setToolTip(QStringLiteral("Расчёты печатных плат (импеданс, ток, переходные, зазоры…)"));
+    m_navGroup->addAction(m_navPcbAction);
+    connect(m_navPcbAction, &QAction::triggered, this, [this] { showSection(2); });
+
     nav->addAction(m_navSimAction);
     nav->addAction(m_navKarnaughAction);
+    nav->addAction(m_navPcbAction);
 
     // Панель разделов — такая же док-панель, как остальные: её можно взять за заголовок сбоку,
     // перенести к любому краю окна или оставить плавающей. У верхнего и нижнего краёв кнопки
@@ -1154,18 +1212,22 @@ void EditorWindow::recheckIssues()
 
 void EditorWindow::showSection(int section, bool autoCreate)
 {
-    section = section == 1 ? 1 : 0;
+    section = section == 1 || section == 2 ? section : 0;
+    if (section == 2 && !m_pcb)                   // раздел «Печатные платы» строится при первом входе
+        createPcbSection();
     m_stack->setCurrentIndex(section);
     if (m_navSimAction)
         m_navSimAction->setChecked(section == 0);
     if (m_navKarnaughAction)
         m_navKarnaughAction->setChecked(section == 1);
+    if (m_navPcbAction)
+        m_navPcbAction->setChecked(section == 2);
 
     if (section == 1 && autoCreate && m_karnaugh->tabCount() == 0)
         m_karnaugh->newTab();
 
     if (m_simDock && m_propDock && m_scopeDock && m_logDock) {   // панели относятся только к схемам
-        if (section == 1 && m_section == 0) {
+        if (section != 0 && m_section == 0) {
             m_simDockWas = !m_simDock->isHidden();
             m_propDockWas = !m_propDock->isHidden();
             m_scopeDockWas = !m_scopeDock->isHidden();
@@ -1174,7 +1236,7 @@ void EditorWindow::showSection(int section, bool autoCreate)
             m_simDock->hide();
             m_propDock->hide();
             m_scopeDock->hide();
-        } else if (section == 0 && m_section == 1) {
+        } else if (section == 0 && m_section != 0) {
             m_simDock->setVisible(m_simDockWas);
             m_propDock->setVisible(m_propDockWas);
             m_scopeDock->setVisible(m_scopeDockWas);
@@ -1190,7 +1252,11 @@ void EditorWindow::showSection(int section, bool autoCreate)
         onTabChanged(m_tabs->currentIndex());
     else
         attachView(nullptr);
-    QWidget *current = section == 1 ? m_karnaugh->currentPage() : m_tabs->currentWidget();
+    QWidget *current = nullptr;
+    if (section == 0)
+        current = m_tabs->currentWidget();
+    else if (section == 1)
+        current = m_karnaugh->currentPage();
     if (current)
         ProjectHub::instance().setActive(ProjectHub::projectOf(current));
     if (m_projectPanel)
@@ -1264,6 +1330,9 @@ void EditorWindow::attachView(CircuitView *view)
     // модальное окно не должно жить внутри обработчика мыши холста.
     m_viewConnections << connect(view, &CircuitView::itemActivated, this, [this](CircuitItem *item) {
         QTimer::singleShot(0, this, [this, item] { openElementDialog(item); });
+    });
+    m_viewConnections << connect(view, &CircuitView::noteEditRequested, this, [this](CircuitItem *wire) {
+        QTimer::singleShot(0, this, [this, wire] { openWireNoteDialog(wire); });
     });
     m_viewConnections << connect(view, &CircuitView::contextMenuRequested,
                                  this, &EditorWindow::showContextMenu);
@@ -1387,6 +1456,7 @@ void EditorWindow::duplicateTab(int index)
     const QString name = hub.uniqueName(project, ProjectHub::Scheme, ProjectHub::nameOf(src) + QStringLiteral(" (копия)"));
 
     CircuitView *dst = addScheme(project, name);          // новая вкладка становится текущей
+    dst->circuitScene()->setMmPerCell(src->circuitScene()->mmPerCell());
     m_tabs->bar()->moveTab(m_tabs->indexOf(dst), index + 1);   // рядом с исходной
     dst->loadSnapshot(data, QStringLiteral("Копия схемы"));
     dst->fitToContent();
@@ -1549,7 +1619,7 @@ void EditorWindow::syncEditActions()
         a->setEnabled(has);
 
     CircuitItem *single = v ? v->singleSelected() : nullptr;
-    m_propsAction->setEnabled(single && single->hasProperties());
+    m_propsAction->setEnabled(single && (single->hasProperties() || single->isWire()));
     m_toggleAction->setEnabled(v && v->selectionHasToggle());
 }
 
@@ -1682,6 +1752,94 @@ void EditorWindow::showContextMenu(const QPoint &globalPos)
         if (v->selectionHasToggle())
             menu.addAction(m_toggleAction);
 
+        // Провод: комментарий (подсказкой или блоком на схеме) и расчёт трассы в калькуляторах «Печатных плат».
+        if (target->isWire()) {
+            menu.addSeparator();
+            QAction *aNote = menu.addAction(QStringLiteral("Комментарий и дифф. пара…"));
+            QAction *aShow = menu.addAction(QStringLiteral("Показывать комментарий блоком на схеме"));
+            aShow->setCheckable(true);
+            aShow->setChecked(target->note().shown);
+            aShow->setEnabled(!target->note().isEmpty());
+            connect(aNote, &QAction::triggered, this, [this, target] {
+                QTimer::singleShot(0, this, [this, target] { openWireNoteDialog(target); });
+            });
+            connect(aShow, &QAction::toggled, this, [v, target](bool on) {
+                WireNote n = target->note();
+                n.shown = on;
+                v->setItemNote(target, n, on ? QStringLiteral("Показать блок комментария") : QStringLiteral("Скрыть блок комментария"));
+            });
+
+            // Дифференциальная пара: пометить проводник (всю цепочку проводов сразу). Выделите по одному проводу
+            // от каждого проводника пары — и «Новая пара»; к уже существующей пара добавляется по её номеру.
+            QList<CircuitItem *> pairWires;
+            for (CircuitItem *ci : v->selectedCircuitItems())
+                if (ci->isWire())
+                    pairWires.append(ci);
+            if (!pairWires.contains(target))
+                pairWires = { target };
+            CircuitScene *pairScene = v->circuitScene();
+            QMenu *pairMenu = menu.addMenu(pairWires.size() > 1 ? QStringLiteral("Дифф. пара (выбрано проводов: %1)").arg(pairWires.size())
+                                                                : QStringLiteral("Дифференциальная пара"));
+            QAction *aNewPair = pairMenu->addAction(QStringLiteral("Новая пара №%1").arg(pairScene->nextFreePair()));
+            connect(aNewPair, &QAction::triggered, this, [this, pairWires, pairScene] {
+                assignDiffPair(pairWires, pairScene->nextFreePair());
+            });
+            const auto existingPairs = pairScene->diffPairs();
+            if (!existingPairs.isEmpty())
+                pairMenu->addSeparator();
+            for (const CircuitScene::PairInfo &info : existingPairs) {
+                QAction *a = pairMenu->addAction(QStringLiteral("Пара №%1 — проводников: %2").arg(info.number).arg(info.traces));
+                a->setCheckable(true);
+                bool all = true;
+                for (CircuitItem *w : std::as_const(pairWires))
+                    all = all && w->traceMark().pair == info.number;
+                a->setChecked(all);
+                const int number = info.number;
+                connect(a, &QAction::triggered, this, [this, pairWires, number] { assignDiffPair(pairWires, number); });
+            }
+            pairMenu->addSeparator();
+            QAction *aNoPair = pairMenu->addAction(QStringLiteral("Убрать из дифф. пары"));
+            bool anyPair = false;
+            for (CircuitItem *w : std::as_const(pairWires))
+                anyPair = anyPair || w->traceMark().pair > 0;
+            aNoPair->setEnabled(anyPair);
+            connect(aNoPair, &QAction::triggered, this, [this, pairWires] { assignDiffPair(pairWires, 0); });
+
+            QMenu *calc = menu.addMenu(QStringLiteral("Рассчитать в «Печатных платах»"));
+            const struct { const char *text; int page; } kCalcs[] = {
+                { "Импеданс проводника", PcbPageId::Impedance },
+                { "Свойства проводника (ток и нагрев)", PcbPageId::Properties },
+                { "Дифференциальная пара / XTALK", PcbPageId::DiffPairs },
+                { "Полоса и максимальная длина", PcbPageId::Bandwidth },
+                { "Ток плавления", PcbPageId::Fusing },
+            };
+            for (const auto &c : kCalcs) {
+                QAction *a = calc->addAction(QString::fromUtf8(c.text));
+                const int page = c.page;
+                connect(a, &QAction::triggered, this, [this, target, page] {
+                    QTimer::singleShot(0, this, [this, target, page] { openPcbForWire(target, page); });
+                });
+            }
+        }
+        // Карта Карно: связь с картой из раздела «Карты Карно».
+        if (target->isKarnaugh()) {
+            menu.addSeparator();
+            QMenu *link = menu.addMenu(QStringLiteral("Связать с картой Карно"));
+            QAction *none = link->addAction(QStringLiteral("Нет (самостоятельная карта)"));
+            none->setCheckable(true);
+            none->setChecked(target->link().isEmpty());
+            connect(none, &QAction::triggered, this, [v, target] { v->setItemLink(target, QString()); });
+            const QStringList names = KarnaughLinks::instance().mapNames(ProjectHub::projectOf(v));
+            for (const QString &name : names) {
+                QAction *a = link->addAction(name);
+                a->setCheckable(true);
+                a->setChecked(target->link() == name);
+                connect(a, &QAction::triggered, this, [v, target, name] { v->setItemLink(target, name); });
+            }
+            if (names.isEmpty())
+                link->addAction(QStringLiteral("В проекте нет карт Карно"))->setEnabled(false);
+        }
+
         // Осциллограмма элемента: на схему отдельным окошком или в нижнюю панель.
         if (!target->isDecoration()) {
             menu.addSeparator();
@@ -1749,25 +1907,215 @@ void EditorWindow::openElementDialog(CircuitItem *item)
     // элемент мог исчезнуть, пока ждали отложенного вызова
     if (!v->circuitScene()->circuitItems().contains(item))
         return;
+    if (item->isWire()) {
+        openWireNoteDialog(item);                 // у провода параметров нет, но есть комментарий
+        return;
+    }
     if (!item->hasProperties())
-        return;                                   // у провода, выключателей и кнопок окна свойств нет
+        return;                                   // у выключателей и кнопок окна свойств нет
 
-    ElementDialog dlg(item, this);
+    ElementDialog dlg(item, this, item->isKarnaugh() ? KarnaughLinks::instance().mapNames(ProjectHub::projectOf(v)) : QStringList());
     if (dlg.exec() != QDialog::Accepted)
         return;
     const QMap<QString, double> values = dlg.values();
     const bool textChanged = dlg.hasText() && dlg.text() != item->text();
+    const bool linkChanged = dlg.hasLink() && dlg.link() != item->link();
     bool paramsChanged = false;
     for (auto it = values.constBegin(); it != values.constEnd(); ++it)
         paramsChanged = paramsChanged || item->param(it.key()) != it.value();
-    if (!textChanged && !paramsChanged)
+    if (!textChanged && !paramsChanged && !linkChanged)
         return;
     v->undoStack()->beginMacro(QStringLiteral("Свойства: ") + item->displayName().toLower());
     if (textChanged)
         v->setItemText(item, dlg.text());
     if (paramsChanged)
         v->setItemParams(item, values);
+    if (linkChanged)                              // после параметров: данные карты важнее значений из окна
+        v->setItemLink(item, dlg.link());
     v->undoStack()->endMacro();
+}
+
+// ================================================================== комментарий провода и связь с расчётами
+
+void EditorWindow::openWireNoteDialog(CircuitItem *wire)
+{
+    CircuitView *v = currentView();
+    if (!v || !wire || !wire->isWire() || !v->circuitScene()->circuitItems().contains(wire))
+        return;
+    WireNoteDialog dlg(wire, this);
+    if (dlg.exec() != QDialog::Accepted)
+        return;
+    const WireNote note = dlg.note();
+    const double width = dlg.widthMm();
+    const int pair = dlg.pairNumber();
+    const bool noteChanged = note != wire->note();
+    const bool widthChanged = std::fabs(wire->pcbWidthMm() - width) > 1e-9;
+    const bool pairChanged = pair != wire->traceMark().pair;
+    if (!noteChanged && !widthChanged && !pairChanged)
+        return;
+    v->undoStack()->beginMacro(QStringLiteral("Свойства провода"));
+    if (noteChanged)
+        v->setItemNote(wire, note, QStringLiteral("Комментарий провода"));
+    if (widthChanged)
+        v->setItemParam(wire, QStringLiteral("pcbWidth"), width);
+    if (pairChanged)
+        assignDiffPair({ wire }, pair);
+    v->undoStack()->endMacro();
+    if (m_traceView == v && m_traceUid == wire->uid())
+        refreshPcbTrace();
+}
+
+void EditorWindow::assignDiffPair(const QList<CircuitItem *> &wires, int number)
+{
+    CircuitView *v = currentView();
+    if (!v)
+        return;
+    CircuitScene *scene = v->circuitScene();
+    QVector<CircuitItem *> targets;                         // провод и вся его трасса, без повторов
+    for (CircuitItem *w : wires) {
+        if (!w || !w->isWire())
+            continue;
+        QVector<CircuitItem *> chain = scene->traceOf(w).wires;
+        if (!chain.contains(w))
+            chain.append(w);
+        for (CircuitItem *c : std::as_const(chain))
+            if (!targets.contains(c))
+                targets.append(c);
+    }
+    std::sort(targets.begin(), targets.end(), [](const CircuitItem *a, const CircuitItem *b) { return a->uid() < b->uid(); });
+    QVector<CircuitItem *> changed;
+    for (CircuitItem *c : std::as_const(targets))
+        if (c->diffPair() != number)
+            changed.append(c);
+    if (changed.isEmpty())
+        return;
+    v->undoStack()->beginMacro(number > 0 ? QStringLiteral("Дифф. пара №%1").arg(number) : QStringLiteral("Убрать из дифф. пары"));
+    for (CircuitItem *c : std::as_const(changed))
+        v->setItemParam(c, QStringLiteral("diffPair"), number);
+    v->undoStack()->endMacro();
+    if (m_traceView == v)
+        refreshPcbTrace();
+}
+
+void EditorWindow::chooseScale()
+{
+    CircuitView *v = currentView();
+    if (!v)
+        return;
+    bool ok = false;
+    const double mm = QInputDialog::getDouble(this, QStringLiteral("Масштаб проводников"),
+                                              QStringLiteral("Миллиметров в одной клетке сетки схемы\n(по нему считается длина проводов и трасс):"),
+                                              v->circuitScene()->mmPerCell(), 0.001, 1000.0, 3, &ok);
+    if (ok)
+        v->setMmPerCell(mm);
+}
+
+void EditorWindow::createPcbSection()
+{
+    m_pcb = new PcbToolkitSection(this);
+    m_stack->addWidget(m_pcb);                    // индекс 2
+    connect(m_pcb, &PcbToolkitSection::traceCommentRequested, this, &EditorWindow::onPcbTraceComment);
+    connect(m_pcb, &PcbToolkitSection::traceShowRequested, this, [this] {
+        CircuitView *v = m_traceView;
+        if (!v)
+            return;
+        activatePage(v);                           // вкладка схемы — в том окне, где она сейчас
+        v->focusItem(m_traceUid);
+    });
+    connect(m_pcb, &PcbToolkitSection::traceUnlinked, this, [this] {
+        for (const QMetaObject::Connection &c : std::as_const(m_traceConns))
+            QObject::disconnect(c);
+        m_traceConns.clear();
+        m_traceUid = 0;
+        m_traceView = nullptr;
+    });
+}
+
+void EditorWindow::openPcbForWire(CircuitItem *wire, int pageId)
+{
+    CircuitView *v = currentView();
+    if (!v || !wire || !v->circuitScene()->circuitItems().contains(wire) || !wire->isWire())
+        return;
+    for (const QMetaObject::Connection &c : std::as_const(m_traceConns))
+        QObject::disconnect(c);
+    m_traceConns.clear();
+    m_traceView = v;
+    m_traceUid = wire->uid();
+    // Пока связь жива, длина трассы следует за правкой схемы.
+    m_traceConns << connect(v->circuitScene(), &CircuitScene::topologyChanged, this, &EditorWindow::refreshPcbTrace)
+                 << connect(v->circuitScene(), &CircuitScene::scaleChanged, this, &EditorWindow::refreshPcbTrace);
+    showSection(2);
+    refreshPcbTrace();
+    m_pcb->showPage(pageId);
+}
+
+void EditorWindow::refreshPcbTrace()
+{
+    if (!m_pcb)
+        return;
+    PcbTrace t;
+    CircuitView *v = m_traceView;
+    CircuitItem *wire = v ? v->itemByUid(m_traceUid) : nullptr;
+    if (wire && wire->scene()) {
+        const CircuitScene::Trace tr = v->circuitScene()->traceOf(wire);
+        t.valid = true;
+        t.name = wire->traceName();
+        t.lengthMm = (tr.wires.isEmpty() ? wire->length() : tr.lengthPx) / CircuitScene::kGrid * v->circuitScene()->mmPerCell();
+        t.widthMm = wire->pcbWidthMm();
+        t.pair = tr.pair;
+        t.pairSize = tr.pairSize;
+        if (tr.pair > 0 && tr.pairSize >= 2) {
+            const double mmPerPx = v->circuitScene()->mmPerCell() / CircuitScene::kGrid;
+            if (tr.lagging)
+                t.skewMm = -(tr.longestPx - tr.lengthPx) * mmPerPx;
+            else if (tr.lengthPx - tr.shortestPx > CircuitScene::kLengthTolerancePx)
+                t.skewMm = (tr.lengthPx - tr.shortestPx) * mmPerPx;
+        }
+    }
+    m_pcb->setTrace(t);
+}
+
+// Результат калькулятора — в комментарий связанного провода. Автоматически — только когда комментарий пуст или сам
+// был создан расчётом: свой текст пользователя не трогаем.
+void EditorWindow::onPcbTraceComment(const QString &text, bool automatic)
+{
+    CircuitView *v = m_traceView;
+    CircuitItem *wire = v ? v->itemByUid(m_traceUid) : nullptr;
+    if (!wire || text.trimmed().isEmpty())
+        return;
+    WireNote n = wire->note();
+    if (automatic) {
+        if (!n.isEmpty() && !n.autoText)
+            return;
+        if (n.text == text && n.autoText)
+            return;
+        n.text = text;
+        n.autoText = true;
+        v->setItemNote(wire, n, QStringLiteral("Расчёт в комментарии провода"), true);
+        return;
+    }
+    if (!n.isEmpty() && !n.autoText && n.text != text) {
+        QMessageBox box(this);
+        box.setWindowTitle(QStringLiteral("Комментарий провода"));
+        box.setText(QStringLiteral("У провода уже есть свой комментарий."));
+        QPushButton *replace = box.addButton(QStringLiteral("Заменить"), QMessageBox::AcceptRole);
+        QPushButton *append = box.addButton(QStringLiteral("Добавить в конец"), QMessageBox::AcceptRole);
+        box.addButton(QStringLiteral("Отмена"), QMessageBox::RejectRole);
+        box.exec();
+        if (box.clickedButton() == static_cast<QAbstractButton *>(append)) {
+            n.text = n.text.trimmed() + QLatin1Char('\n') + text;
+            n.autoText = false;
+        } else if (box.clickedButton() == static_cast<QAbstractButton *>(replace)) {
+            n.text = text;
+            n.autoText = true;
+        } else {
+            return;
+        }
+    } else {
+        n.text = text;
+        n.autoText = true;
+    }
+    v->setItemNote(wire, n, QStringLiteral("Расчёт в комментарии провода"));
 }
 
 void EditorWindow::showSettings()
@@ -1944,7 +2292,7 @@ void EditorWindow::refreshProjectPanel()
         }
     }
     m_projectPanel->setContent(list);
-    m_projectPanel->setCurrentPage(m_section == 1 ? m_karnaugh->currentPage() : m_tabs->currentWidget());
+    m_projectPanel->setCurrentPage(m_section == 1 ? m_karnaugh->currentPage() : (m_section == 0 ? m_tabs->currentWidget() : nullptr));
 }
 
 EditorWindow *EditorWindow::ownerOf(QWidget *page)
@@ -2080,8 +2428,13 @@ ProjectDoc EditorWindow::collectProject(int projectId) const
             QWidget *page = w->m_tabs->widget(i);
             if (ProjectHub::projectOf(page) != projectId)
                 continue;
-            if (auto *view = qobject_cast<CircuitView *>(page))
-                doc.schemes.append({ ProjectHub::nameOf(page), view->snapshot(false) });
+            if (auto *view = qobject_cast<CircuitView *>(page)) {
+                SchemeDoc sd;
+                sd.name = ProjectHub::nameOf(page);
+                sd.items = view->snapshot(false);
+                sd.mmPerCell = view->circuitScene()->mmPerCell();
+                doc.schemes.append(sd);
+            }
         }
         for (int i = 0; i < w->m_karnaugh->tabCount(); ++i) {
             QWidget *page = w->m_karnaugh->page(i);
@@ -2121,6 +2474,7 @@ int EditorWindow::createProjectFromDoc(const ProjectDoc &doc, const QString &pat
     QWidget *firstScheme = nullptr;
     for (const SchemeDoc &s : doc.schemes) {
         CircuitView *view = addScheme(id, s.name);
+        view->circuitScene()->setMmPerCell(s.mmPerCell);
         view->loadSnapshot(s.items, QString());
         view->fitToContent();
         view->undoStack()->clear();
@@ -2139,6 +2493,7 @@ int EditorWindow::createProjectFromDoc(const ProjectDoc &doc, const QString &pat
             map->setState(st);
         }
     }
+    KarnaughLinks::instance().syncProject(id);                // элементы «Карта Карно» берут данные из связанных карт
     if (doc.schemes.isEmpty() && doc.maps.isEmpty())
         firstScheme = addScheme(id);
 

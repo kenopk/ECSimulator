@@ -329,6 +329,14 @@ void Theme::setShowNearMiss(bool on)
     commit();
 }
 
+void Theme::setShowLengthMarks(bool on)
+{
+    if (on == m_showLengthMarks)
+        return;
+    m_showLengthMarks = on;
+    commit();
+}
+
 QColor Theme::voltageColor(double volts) const
 {
     const double t = std::clamp(volts / m_voltageScale, -1.0, 1.0);
@@ -350,6 +358,7 @@ void Theme::load()
     m_showLabels    = s.value("theme/labels", true).toBool();
     m_showJunctions = s.value("theme/junctions", true).toBool();
     m_showNearMiss  = s.value("theme/nearMiss", true).toBool();
+    m_showLengthMarks = s.value("theme/lengthMarks", true).toBool();
     rebuild();
 }
 
@@ -363,6 +372,7 @@ void Theme::save() const
     s.setValue("theme/labels", m_showLabels);
     s.setValue("theme/junctions", m_showJunctions);
     s.setValue("theme/nearMiss", m_showNearMiss);
+    s.setValue("theme/lengthMarks", m_showLengthMarks);
 }
 
 void Theme::applyToApplication()

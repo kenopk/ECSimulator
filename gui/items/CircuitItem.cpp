@@ -1,8 +1,10 @@
 #include "items/CircuitItem.h"
+#include "items/NoteItem.h"
 #include "tools/KarnaughSolver.h"
 
 #include <QFont>
 #include <QFontMetricsF>
+#include <QLocale>
 #include <QPainter>
 #include <QPainterPathStroker>
 #include <QPolygonF>
@@ -242,6 +244,109 @@ void CircuitItem::setText(const QString &t)
     update();
 }
 
+// ---------------------------------------------------------------- комментарий и длина провода
+
+void CircuitItem::setNote(const WireNote &n)
+{
+    if (n == m_note)
+        return;
+    m_note = n;
+    updateNoteItem();
+    update();
+}
+
+void CircuitItem::updateNoteItem()
+{
+    const bool want = isWire() && !m_preview && m_note.shown && !m_note.isEmpty();
+    if (!want) {
+        if (m_noteItem) {
+            delete m_noteItem.data();
+            m_noteItem = nullptr;
+        }
+        return;
+    }
+    if (!m_noteItem)
+        m_noteItem = new NoteItem(this);
+    m_noteItem->moveTo(midpoint() + QPointF(m_note.offset));
+    m_noteItem->refresh();
+}
+
+void CircuitItem::setTraceMark(const TraceMark &t)
+{
+    if (t == m_trace)
+        return;
+    m_trace = t;
+    update();
+    if (m_noteItem)
+        m_noteItem->refresh();
+}
+
+double CircuitItem::traceLengthMm() const
+{
+    double mmPerCell = 1.0;
+    if (auto *s = qobject_cast<CircuitScene *>(scene()))
+        mmPerCell = s->mmPerCell();
+    const double px = m_trace.lengthPx > 0 ? m_trace.lengthPx : length();
+    return px / CircuitScene::kGrid * mmPerCell;
+}
+
+double CircuitItem::traceSkewMm() const
+{
+    if (m_trace.pair <= 0 || m_trace.pairSize < 2)
+        return 0.0;
+    double mmPerCell = 1.0;
+    if (auto *s = qobject_cast<CircuitScene *>(scene()))
+        mmPerCell = s->mmPerCell();
+    const double k = mmPerCell / CircuitScene::kGrid;
+    if (m_trace.lagging)
+        return -(m_trace.longestPx - m_trace.lengthPx) * k;
+    const double over = (m_trace.lengthPx - m_trace.shortestPx) * k;
+    return over * CircuitScene::kGrid / mmPerCell > 0.5 ? over : 0.0;
+}
+
+QString CircuitItem::noteFooter() const
+{
+    if (!isWire())
+        return {};
+    const QLocale loc = QLocale::system();
+    QString s = QStringLiteral("L = %1 мм").arg(loc.toString(traceLengthMm(), 'f', 2));
+    if (m_trace.pair > 0) {
+        s += QStringLiteral(" · дифф. пара №%1").arg(m_trace.pair);
+        if (m_trace.pairSize < 2) {
+            s += QStringLiteral(" · второго проводника нет");
+        } else {
+            const double skew = traceSkewMm();
+            if (skew < 0)
+                s += QStringLiteral(" · короче на %1 мм").arg(loc.toString(-skew, 'f', 2));
+            else if (skew > 0)
+                s += QStringLiteral(" · длиннее на %1 мм").arg(loc.toString(skew, 'f', 2));
+            else
+                s += QStringLiteral(" · длины равны");
+        }
+    }
+    return s;
+}
+
+QString CircuitItem::hoverTip() const
+{
+    if (!isWire() || m_preview)
+        return {};
+    const bool comment = !m_note.isEmpty() && !m_note.shown;
+    if (!comment && m_trace.pair <= 0)
+        return {};
+    QString html;
+    if (comment)
+        html += QStringLiteral("<b>%1</b><br>").arg(m_note.text.toHtmlEscaped().replace(QLatin1Char('\n'), QStringLiteral("<br>")));
+    html += QStringLiteral("<span style=\"color:#8b9099\">%1</span>").arg(noteFooter().toHtmlEscaped());
+    return html;
+}
+
+QString CircuitItem::traceName() const
+{
+    const QString first = m_note.text.trimmed().section(QLatin1Char('\n'), 0, 0).trimmed();
+    return first.isEmpty() ? QStringLiteral("Провод") : first;
+}
+
 bool CircuitItem::hasParts() const
 {
     return m_type == ElementType::Keypad || m_type == ElementType::DipSwitch || m_type == ElementType::KarnaughMap;
@@ -254,6 +359,23 @@ void CircuitItem::setCells(const QVector<quint8> &cells)
     m_cells = cells;
     recomputeKarnaugh();
     update();
+    notifyKarnaugh();
+}
+
+void CircuitItem::setVarNames(const QStringList &names)
+{
+    if (names == m_varNames)
+        return;
+    m_varNames = names;
+    recomputeKarnaugh();
+    update();
+}
+
+void CircuitItem::notifyKarnaugh()
+{
+    if (isKarnaugh())
+        if (auto *s = qobject_cast<CircuitScene *>(scene()))
+            emit s->karnaughChanged(this);
 }
 
 // Формула по выбранным клеткам: параметр «Что выводить» — СДНФ, СКНФ, минимальная ДНФ или КНФ.
@@ -266,6 +388,7 @@ void CircuitItem::recomputeKarnaugh()
     Karnaugh::Input in;
     in.width = std::clamp(int(std::lround(param(QStringLiteral("width")))), 1, kKarnaughStride);
     in.height = std::clamp(int(std::lround(param(QStringLiteral("height")))), 1, kKarnaughStride);
+    in.names = m_varNames;
     in.cells.resize(in.width * in.height);
     for (int r = 0; r < in.height; ++r)
         for (int c = 0; c < in.width; ++c)
@@ -508,6 +631,7 @@ void CircuitItem::setGeometry(const QPoint &a, const QPoint &bIn, bool flip)
     m_shapeDirty = true;
     updateLabelRect();
     notifyScene();
+    updateNoteItem();
     update();
 }
 
@@ -560,6 +684,7 @@ int CircuitItem::endpointAt(const QPointF &pos, qreal tol) const
 
 void CircuitItem::setParam(const QString &key, double value)
 {
+    const double old = m_params.value(key);
     prepareGeometryChange();
     m_params[key] = value;
     refreshVariant();
@@ -567,10 +692,15 @@ void CircuitItem::setParam(const QString &key, double value)
     m_label = computeLabel();
     updateLabelRect();
     update();
+    if (old != value && (key == QLatin1String("width") || key == QLatin1String("height")))
+        notifyKarnaugh();
+    if (old != value && key == QLatin1String("diffPair"))
+        retraceScene();
 }
 
 void CircuitItem::setParams(const QMap<QString, double> &p)
 {
+    const int oldPair = diffPair();
     prepareGeometryChange();
     for (auto it = p.constBegin(); it != p.constEnd(); ++it)
         m_params[it.key()] = it.value();
@@ -579,6 +709,19 @@ void CircuitItem::setParams(const QMap<QString, double> &p)
     m_label = computeLabel();
     updateLabelRect();
     update();
+    if (isKarnaugh())
+        notifyKarnaugh();
+    if (diffPair() != oldPair)
+        retraceScene();
+}
+
+// Номер дифф. пары поменялся: трассы и красная подсветка пересчитываются.
+void CircuitItem::retraceScene()
+{
+    if (!isWire())
+        return;
+    if (auto *s = qobject_cast<CircuitScene *>(scene()))
+        s->invalidateConnectivity();
 }
 
 QString CircuitItem::computeLabel() const
@@ -725,6 +868,7 @@ void CircuitItem::setPreview(bool on)
         return;
     m_preview = on;
     notifyScene();
+    updateNoteItem();
     update();
 }
 
@@ -796,6 +940,9 @@ QVariant CircuitItem::itemChange(GraphicsItemChange change, const QVariant &valu
 {
     if (change == ItemSceneChange || change == ItemSceneHasChanged)
         notifyScene();
+    if (change == ItemSceneHasChanged && isKarnaugh() && !m_link.isEmpty())
+        if (auto *s = qobject_cast<CircuitScene *>(scene()))
+            emit s->karnaughAttached(this);               // схему вернули на сцену: данные берутся из связанной карты
     else if (change == ItemSelectedHasChanged)
         update();
     return QGraphicsItem::itemChange(change, value);
@@ -974,8 +1121,21 @@ void CircuitItem::paint(QPainter *p, const QStyleOptionGraphicsItem *, QWidget *
         p->scale(1.0, -1.0);
 
     if (isWire()) {
-        p->setPen(QPen(pinColor[0], w, Qt::SolidLine, Qt::RoundCap));
+        const bool pairMarks = m_trace.pair > 0 && !m_preview && theme.showLengthMarks();
+        // Проводник дифф. пары, который короче напарника, целиком красный.
+        const QColor wireColor = pairMarks && m_trace.lagging ? pal.negative : pinColor[0];
+        p->setPen(QPen(wireColor, pairMarks && m_trace.lagging ? w + 0.6 : w, Qt::SolidLine, Qt::RoundCap));
         p->drawLine(QPointF(0, 0), QPointF(len, 0));
+        // номер дифф. пары: k штрихов поперёк трассы у k-й пары (на самом длинном проводе каждой трассы)
+        if (pairMarks && m_trace.carrier && len > 4.0) {
+            const int k = std::min(m_trace.pair, 8);
+            const qreal gap = std::min<qreal>(5.0, (len - 2.0) / std::max(1, k));
+            p->setPen(QPen(pal.element, w + 0.6, Qt::SolidLine, Qt::FlatCap));
+            for (int i = 0; i < k; ++i) {
+                const qreal x = len / 2.0 + (i - (k - 1) / 2.0) * gap;
+                p->drawLine(QPointF(x, -6.5), QPointF(x, 6.5));
+            }
+        }
     } else {
         SymbolPainter::PaintContext ctx;
         ctx.p = p;
@@ -995,6 +1155,7 @@ void CircuitItem::paint(QPainter *p, const QStyleOptionGraphicsItem *, QWidget *
         if (isKarnaugh()) {
             ctx.cells = m_cells;
             ctx.result = m_formula;
+            ctx.names = m_varNames;
         }
         if (m_type == ElementType::DecimalDisplay)
             ctx.digits = int(param(QStringLiteral("digits")));

@@ -130,6 +130,64 @@ ChangeCellsCommand::ChangeCellsCommand(CircuitItem *item, const QVector<quint8> 
 void ChangeCellsCommand::redo() { m_item->setCells(m_new); }
 void ChangeCellsCommand::undo() { m_item->setCells(m_old); }
 
+ChangeNoteCommand::ChangeNoteCommand(CircuitItem *item, const WireNote &oldNote, const WireNote &newNote,
+                                     const QString &text, bool mergeable)
+    : QUndoCommand(text), m_item(item), m_old(oldNote), m_new(newNote), m_mergeable(mergeable)
+{
+}
+
+void ChangeNoteCommand::redo() { m_item->setNote(m_new); }
+void ChangeNoteCommand::undo() { m_item->setNote(m_old); }
+
+bool ChangeNoteCommand::mergeWith(const QUndoCommand *other)
+{
+    if (!m_mergeable || other->id() != id())
+        return false;
+    const auto *o = static_cast<const ChangeNoteCommand *>(other);
+    if (o->m_item != m_item)
+        return false;
+    m_new = o->m_new;
+    return true;
+}
+
+ChangeLinkCommand::ChangeLinkCommand(CircuitItem *item, const QString &newLink)
+    : QUndoCommand(newLink.isEmpty() ? QStringLiteral("Снять связь с картой Карно")
+                                     : QStringLiteral("Связь с картой Карно «%1»").arg(newLink)),
+      m_item(item), m_oldLink(item->link()), m_newLink(newLink),
+      m_oldState(KarnaughLinks::captureElement(item))
+{
+}
+
+void ChangeLinkCommand::redo()
+{
+    KarnaughLinks &links = KarnaughLinks::instance();
+    m_item->setLink(m_newLink);
+    if (m_first) {
+        m_first = false;
+        links.pull(m_item);                                  // данные берутся из карты
+        m_newState = KarnaughLinks::captureElement(m_item);
+    } else {
+        links.restoreElement(m_item, m_newState);
+        links.pull(m_item);
+    }
+}
+
+void ChangeLinkCommand::undo()
+{
+    KarnaughLinks &links = KarnaughLinks::instance();
+    m_item->setLink(m_oldLink);
+    links.restoreElement(m_item, m_oldState);
+    links.pull(m_item);                                      // прежняя карта могла измениться за это время
+}
+
+ChangeScaleCommand::ChangeScaleCommand(CircuitScene *scene, double oldMm, double newMm)
+    : QUndoCommand(QStringLiteral("Масштаб схемы")), m_scene(scene), m_old(oldMm), m_new(newMm)
+{
+}
+
+void ChangeScaleCommand::redo() { m_scene->setMmPerCell(m_new); }
+void ChangeScaleCommand::undo() { m_scene->setMmPerCell(m_old); }
+
 ChangeParamCommand::ChangeParamCommand(CircuitItem *item, const QString &key, double oldValue, double newValue)
     : QUndoCommand(QStringLiteral("Изменение параметра")),
       m_item(item), m_key(key), m_old(oldValue), m_new(newValue)

@@ -1,7 +1,9 @@
 # PROJECT_MAP — GOVNO / ECSimulator (симулятор электрических цепей, C++ / Qt)
 
 > Файл-карта проекта. Отправляй его целиком в начале нового чата — дальше ничего объяснять не нужно.
-> Состояние на **17.10.2026**: gui v0.2 готов как редактор, ядро (core) — только контракт типов, расчёта нет.
+> Состояние на **20.10.2026** (карта сверена с исходниками): gui v0.2 — редактор, проекты `.govno`, карты Карно,
+> осциллограммы (интерфейс), раздел «Печатные платы» (19 калькуляторов со справкой «?»), комментарии проводов, дифференциальные пары
+> (штрихи по номеру, красный проводник короче напарника) и связь схемы с калькуляторами и картами Карно; ядро (core) — контракт типов элементов и математика печатных плат; расчёта цепей (MNA) нет.
 
 ---
 
@@ -16,7 +18,7 @@
 
 | Часть | Что делает | Зависимости |
 |---|---|---|
-| **core** (ядро) | Реестр элементов, модель цепи, расчёт (MNA), сохранение/загрузка. Без GUI. | Только C++17 (максимум `QtCore`) |
+| **core** (ядро) | Реестр элементов, модель цепи, расчёт (MNA), сохранение/загрузка; математика «Печатных плат». Без GUI. | Только C++17 (максимум `QtCore`) |
 | **gui** (оболочка) | Окна, холст, рисование символов, ввод, диалоги, темы. | Qt Widgets + публичные заголовки ядра |
 
 Правило для любого запроса: затрагивает расчёт, формат файла, параметры элементов → **core**;
@@ -25,8 +27,8 @@
 ## 2. Технологии и окружение
 
 - C++17, Qt 6 (сборка: Qt 6.11.1, MinGW 64-bit, Debug), CMake ≥ 3.16, `AUTOMOC`, `AUTORCC`
-- IDE: Qt Creator, Windows 10. Папка: `C:\Users\second\ECSimulator`
-- Git: ветка `main`. Сборка — в `build/Desktop_Qt_6_11_1_MinGW_64_bit_Debug/` (в `.gitignore`)
+- IDE: Qt Creator, Windows. Исходная папка: `C:\Users\second\ECSimulator`; копия для работы: `...\Documents\ECSimulator-main`
+- Git: в исходной папке ветка `main`; в копии `ECSimulator-main` каталога `.git` нет. Сборка — в `build/Desktop_Qt_6_11_1_MinGW_64_bit_Debug/` (в `.gitignore`)
 - Цель сборки: исполняемый `GOVNO` (`WIN32_EXECUTABLE`), библиотека `govno::core`
 - Язык комментариев и интерфейса: русский. Настройки хранятся в `QSettings` (организация/приложение `GOVNO`)
 
@@ -36,59 +38,85 @@
 ECSimulator/
 ├─ CMakeLists.txt                  – project(GOVNO 0.2), C++17, /utf-8 для MSVC; add_subdirectory(core, gui)
 ├─ .gitignore                      – build/, build-*/, .qtcreator/, *.user, бинарники
+├─ README.md                       – побайтовая копия этого файла (⚠ при правке карты обновлять оба)
 ├─ map/PROJECT_MAP.md              – этот файл
-├─ icon.rc, images/logo.png|ico    – ⚠ остатки старой версии в корне (не используются сборкой, дубли gui/resources)
+├─ icon.rc, images/logo.png|ico    – ⚠ остатки старой версии в корне (сборкой не используются; побайтово совпадают с gui/resources)
 │
-├─ core/                           – ЯДРО (пока только контракт типов)
-│   ├─ CMakeLists.txt              – INTERFACE-библиотека govno_core (alias govno::core)
-│   └─ include/govno/core/
-│       └─ ElementTypes.h  (1461)  – Category, ElementType (180), ParamDef, ElementInfo, Dynamic,
-│                                    ChipPin/ChipLayout, parseChipLayout, variantOf, layoutFor,
-│                                    pinCountFor, pinNamesFor, allElements(), elementInfo()
+├─ core/                           – ЯДРО (контракт типов элементов + математика «Печатных плат»; расчёта цепей нет)
+│   ├─ CMakeLists.txt              – INTERFACE-библиотека govno_core (alias govno::core); цель `pcb_check` при -DGOVNO_BUILD_TESTS=ON
+│   ├─ include/govno/core/
+│   │   ├─ ElementTypes.h  (1557)  – Category, ElementType (181), ParamDef, ElementInfo, Dynamic,
+│   │   │                            ChipPin/ChipLayout, parseChipLayout, variantOf, layoutFor,
+│   │   │                            pinCountFor, pinNamesFor, allElements(), elementInfo()
+│   │   ├─ PcbToolkit.h            – подключает всё из pcb/ (только заголовки, без Qt, namespace govno::core::pcb)
+│   │   └─ pcb/                    – Common.h (константы, меры), Materials.h (подложки, медь, травление), Lines.h (микрополосок, полосковые,
+│   │                                копланарный, дифф. пары и NEXT, длина волны), Current.h (ток проводника, скин-слой, ток плавления,
+│   │                                переходные отверстия), Board.h (зазоры IPC-2221, падстеки, PDN, планарные катушки, тепло, AWG, сверла,
+│   │                                винты, встроенные резисторы), Circuits.h (закон Ома, цепочки R/L/C, аттенюаторы, кварц/PPM, XL/XC, конвертеры)
+│   └─ tests/pcb_check.cpp (222)   – 92 проверки по контрольным значениям эталонной программы; запуск: ctest
 │
 └─ gui/                            – ВИЗУАЛЬНАЯ ОБОЛОЧКА (исполняемый GOVNO)
-    ├─ CMakeLists.txt              – список исходников, Qt6::Widgets + govno::core
+    ├─ CMakeLists.txt              – список исходников, Qt6::Widgets + Qt6::PrintSupport + govno::core
     ├─ main.cpp           (21)     – QApplication, Theme::load/apply, MainWindow (maximized)
     ├─ app/
-    │   ├─ MainWindow.*   (113)    – стартовый экран (Создать / Открыть… / Настройки / О программе) + QStackedWidget
-    │   └─ EditorWindow.* (1266)   – редактор: вкладки, меню, левая панель разделов (тоже перемещаемая док-панель), QStackedWidget (вкладки схем / KarnaughSection), док-панели «Симуляция», «Элемент» и «Осциллограммы» (снизу) (QDockWidget: двигаются, закрепляются по краям, плавают; видны только в разделе схем); вкладки схем можно оторвать в новое окно (EditorWindow standalone) и вернуть в любое окно; имена «Схема N» и нумерация общие для всех окон (реестр allEditors),
-    │                                статус-строка, горячие клавиши (таблица kKeys), QUndoGroup
+    │   ├─ MainWindow.*   (128)    – стартовый экран (Создать схему / Открыть проект… / Настройки / О программе) + QStackedWidget; заголовок окна = имя активного проекта
+    │   └─ EditorWindow.* (2694)   – редактор: вкладки, меню (Файл · Правка · Элементы · Вид · Справка), QStackedWidget из трёх разделов: 0 — вкладки схем, 1 — KarnaughSection, 2 — PcbToolkitSection (создаётся при первом входе, `showSection(2)`). Док-панели (QDockWidget: двигаются, закрепляются по краям, плавают): «Разделы» (узкая левая, только значки), «Проекты» (слева), «Симуляция» и «Элемент» (справа), «Осциллограммы» и «Журнал симуляции» (снизу, во вкладках; скрыты, пока не нужны); в разделах карт Карно и печатных плат панели схем прячутся. Вкладки схем и карт можно оторвать в новое окно (EditorWindow standalone) и вернуть в любое окно; имена «Схема N» и нумерация общие для всех окон (реестр allEditors). Провода и связи: `openWireNoteDialog` (комментарий и пара), `assignDiffPair` (пометка проводника номером пары), `chooseScale` (Вид → «Масштаб проводников»), `openPcbForWire / refreshPcbTrace / onPcbTraceComment` (связь с калькуляторами).
+    │                                Здесь же: статус-строка, горячие клавиши (таблица kKeys), QUndoGroup, проекты (новый/открыть/сохранить/закрыть/удалить), остановка симуляции (stopSimulationWithIssues)
     ├─ canvas/
-    │   ├─ CircuitScene.* (355)    – сцена: сетка 16 px, узлы, «почти-соединения», анимация тока
-    │   └─ CircuitView.*  (1113)   – весь ввод мыши/клавиатуры: режимы, перенос, поворот, рамка,
-    │                                буфер обмена, слепки, масштаб, панорама; владеет сценой и QUndoStack
+    │   ├─ CircuitScene.* (505)    – сцена: сетка 16 px, узлы, «почти-соединения», анимация тока, сигнал topologyChanged; трассы и дифф. пары (`rebuildTraces`, `diffPairs`, `nextFreePair`), масштаб `mmPerCell`, сигналы scaleChanged / karnaughChanged / karnaughAttached
+    │   └─ CircuitView.*  (1438)   – весь ввод мыши/клавиатуры: режимы, перенос, поворот, рамка,
+    │                                буфер обмена, слепки, масштаб, панорама, осциллограммы на схеме, плашка остановки, комментарии проводов (блок, подсказка), связь карт Карно; владеет сценой и QUndoStack
     ├─ items/
-    │   ├─ CircuitItem.*  (832)    – ЕДИНЫЙ QGraphicsItem для провода и любого элемента; таблица колеса kWheel
-    │   ├─ SymbolPainter.*(1198)   – символы по ГОСТ, геометрия выводов (spec), иконки, корпуса микросхем
-    │   └─ SymbolPainterExtra.inc (1249) – символы расширенного набора, модули (включается в SymbolPainter.cpp)
-    ├─ commands/Commands.* (143)   – QUndoCommand: AddItems, RemoveItems, Geometry, ChangeText, ChangeParam
+    │   ├─ CircuitItem.*  (1231)   – ЕДИНЫЙ QGraphicsItem для провода и любого элемента; таблица колеса kWheel (34 записи); комментарий провода (`WireNote`), метка трассы (`TraceMark`: номер пары, штрихи, красный «короче напарника»; параметр `diffPair`), связь Карно (`link`, `varNames`)
+    │   ├─ NoteItem.*     (136+45) – блок комментария провода: дочерний элемент провода, карточка с пунктирной линией-выноской, «×», перенос мышью
+    │   ├─ WireNote.h     (19)     – `WireNote {text, shown, offset, autoText}`
+    │   ├─ SymbolPainter.*(1229)   – символы по ГОСТ, геометрия выводов (spec), иконки, корпуса микросхем
+    │   └─ SymbolPainterExtra.inc (1694) – символы расширенного набора, модули (включается в SymbolPainter.cpp)
+    ├─ commands/Commands.* (209)   – QUndoCommand: AddItems, RemoveItems, Geometry, ChangeText, ChangeCells (карта Карно), ChangeParam, ChangeNote, ChangeScale, ChangeLink
     ├─ dialogs/
-    │   ├─ ElementDialog.* (128)   – окно «Свойства» (двойной клик / F2): все параметры + текст надписи
-    │   └─ SettingsDialog.*(155)   – тема, акцент, сетка, подписи, узлы, красные концы
+    │   ├─ ElementDialog.* (161)   – окно «Свойства» (двойной клик / F2): все параметры + текст надписи; у карты Карно — список «Связь с картой Карно»
+    │   ├─ WireNoteDialog.*(124)   – окно «Провод: комментарий и дифф. пара»: текст, «показывать блоком», ширина на плате, галочка и номер пары
+    │   └─ SettingsDialog.*(160)   – тема, акцент, сетка, подписи, узлы, красные концы, метки дифф. пар
+    ├─ pcb/                       – раздел «Печатные платы» (отдельная вкладка слева, как «Карты Карно»; в проект не сохраняется, настройки — `QSettings pcb/*`)
+    │   ├─ PcbCore.h              – второе (после util/CoreTypes.h) место, где gui включает заголовки ядра: `pcbcore::` = govno::core::pcb
+    │   ├─ PcbToolkitSection.*(387) – раздел: многорядная полоса из 19 подвкладок (7+7+5, ряд выбранной вкладки уходит вниз), стек страниц, правая панель, «Информация», печать (QPrinter); панель связи с проводом (`pcbLinkBar`) и авто-комментарий (таймер 450 мс)
+    │   ├─ PcbPage.* / PcbContext.h – база страницы (рамка, кнопка «?» со справкой, `solve()`, `infoItems()`, `receiveValue()`, сигнал `sendValue`, `usesTrace()/setTrace()/traceSummary()` — связь с проводом схемы) и общие настройки `PcbContext` (медь, материал, температуры, единицы, режим IPC, травление)
+    │   ├─ PcbOptions.* (442)     – правая панель: медь/покрытие, блок страницы, единицы, подложка (Er, Tg), нагрев/окружение, «Параметры…» (`PcbSettingsDialog`), «Печать», «Расчёт!»; серым — неиспользуемое страницей
+    │   ├─ PcbWidgets.* (983)     – `PcbField` (значение + единица внутри рамки; мм↔мил↔мкм по `PcbContext::unitMode()`), `PcbChoice`, `PcbStepSlider`, `PcbDiagram` (схемы платы, рисуются кодом), форматирование чисел (`PcbFmt`)
+    │   ├─ PcbPagesLines.cpp (797) – Полоса и макс. длина, Импеданс проводника (6 типов линий), Эффективная Er, Длина волны, Дифф. пары / XTALK (6 типов); «Полоса», «Импеданс» и «Дифф. пары» берут длину/ширину трассы из схемы
+    │   ├─ PcbPagesCurrent.cpp (643) – Свойства проводника (IPC-2221/2152), Ток плавления, Переходные отверстия (+ «пенёк»), Мин. зазор проводников; «Свойства» и «Ток плавления» берут длину/ширину трассы из схемы
+    │   ├─ PcbPagesBoard.cpp (760) – PDN, Планарные катушки, Падстек (7 режимов), Тепловой режим, Механика (AWG, сверла, винты), Встроенные резисторы
+    │   ├─ PcbPagesCircuits.cpp (693) – Конвертер, Закон Ома (+ светодиод, R/C/L, аттенюаторы), PPM / кварц, Реактивное сопротивление
+    │   ├─ PcbDialogs.* (391)     – справочные окна: приставки СИ, дБм, конденсаторы, цветовой код резистора, правила проектирования, таблица IPC-2221, пояснения, окно справки «?»
+    │   ├─ PcbHelp.*      (266)   – тексты справки «?» для всех 19 страниц (`pcbHelpHtml(pageId)`: как пользоваться, что получается, замечания, связь со схемой)
+    │   ├─ PcbTrace.h     (22)    – `PcbTrace {valid, name, lengthMm, widthMm, pair, pairSize, skewMm}` — трасса схемы и её пара, переданные в раздел
+    │   └─ PcbPages.cpp, PcbPagesInternal.h – фабрика `createPcbPages()` (порядок = `PcbPageId`) и общие помощники раскладки
     ├─ project/
-    │   ├─ ProjectFile.*          – `ProjectDoc` (схемы + карты Карно), сохранение/чтение JSON `.govno` (тип элемента — по стабильному `id` реестра; формат версии 1); `ProjectHub` — реестр ОТКРЫТЫХ проектов (id, имя, файл, «скрыт», активный) и страниц: у каждой схемы/карты в свойствах проект, вид и имя (имена уникальны внутри проекта), `notify()` об изменении вкладок
-    │   └─ ProjectPanel.*         – док-панель «Проекты»: дерево всех открытых проектов (у каждого «Схемы» и «Карты Карно»); двойной клик по странице — открыть, по пустой группе — создать первую страницу, ПКМ по проекту — открыть в проводнике, скрыть/показать, сохранить, сохранить как, переименовать, закрыть, удалить
+    │   ├─ ProjectFile.*  (437)   – `ProjectDoc` (схемы + карты Карно), сохранение/чтение JSON `.govno` (тип элемента — по стабильному `id` реестра; формат версии 1; необязательные поля: `mmPerCell` схемы, `link` элемента, `note` провода); `ProjectHub` — реестр ОТКРЫТЫХ проектов (id, имя, файл, «скрыт», активный) и страниц: у каждой схемы/карты в свойствах проект, вид и имя (имена уникальны внутри проекта), `notify()` об изменении вкладок
+    │   └─ ProjectPanel.* (214)   – док-панель «Проекты»: дерево всех открытых проектов (у каждого «Схемы» и «Карты Карно»); двойной клик по странице — открыть, по пустой группе — создать первую страницу, ПКМ по проекту — открыть в проводнике, скрыть/показать, сохранить, сохранить как, переименовать, закрыть, удалить
     ├─ tools/
-    │   ├─ KarnaughSection.*      – раздел «Карты Карно»: свои вкладки Карта 1, Карта 2… (переименование, закрытие, ПКМ); полоса DetachableTabBar вида 1 — карты переносятся между окнами и отрываются в новое окно
-    │   ├─ KarnaughSolver.*       – расчёт карты Карно любого размера: СДНФ/СКНФ, минимальные ДНФ/КНФ (Куайн–Мак-Класки, X — безразличные)
-    │   └─ KarnaughWidget.*       – вкладка «Карта Карно»: сетка 0/1/X (KarnaughCanvas) в стиле sublime.tools, имена переменных, четыре результата 2×2: сверху минимальные ДНФ и КНФ, снизу СДНФ и СКНФ (отрицания — чертой сверху); ширина × высота задаёт пользователь, фоновый расчёт
+    │   ├─ KarnaughSection.*(397) – раздел «Карты Карно»: свои вкладки Карта 1, Карта 2… (переименование, закрытие, ПКМ); полоса DetachableTabBar вида 1 — карты переносятся между окнами и отрываются в новое окно
+    │   ├─ KarnaughLinks.*(212+56) – синглтон: двусторонняя связь элемента «Карта Карно» на схеме со страницей раздела карт (по имени)
+    │   ├─ KarnaughSolver.*(471)  – расчёт карты Карно любого размера: СДНФ/СКНФ, минимальные ДНФ/КНФ (Куайн–Мак-Класки, X — безразличные)
+    │   └─ KarnaughWidget.*(658)  – вкладка «Карта Карно» (сигнал `stateChanged` для связи со схемой): сетка 0/1/X (KarnaughCanvas) в стиле sublime.tools, имена переменных, четыре результата 2×2: сверху минимальные ДНФ и КНФ, снизу СДНФ и СКНФ (отрицания — чертой сверху); ширина × высота задаёт пользователь, фоновый расчёт
     ├─ widgets/
-    │   ├─ ParamForm.*    (353)    – форма параметров из реестра: поле + выпадающий список единиц
-    │   ├─ PropertiesPanel.*(205)  – правая панель «Элемент» (быстрая правка выбранного)
-    │   └─ SimulationPanel.*(119)  – правая панель «Симуляция»: Сброс, Старт/Стоп, 3 ползунка
-    ├─ scope/                     – осциллограммы: ScopeSource (отсчёты t, V, I + свои ScopeSettings у каждого элемента),
-    │   │                           ScopePlot (рисование, шкалы, триггер, X-Y, информация), ScopeDialog («Параметры осциллографа»),
-    │   │                           ScopeMenu (меню ПКМ), ScopeWidget (ScopeView, ScopeBoard — нижняя панель рядом/друг над другом,
-    │   │                           ScopeWindow — отдельное окно), ScopeItem (окошко на схеме с линией к элементу)
-    ├─ sim/                       – SimIssue (причина остановки), Preflight (проверки интерфейса), IssueLog (журнал), IssueBanner (плашка)
-    ├─ theme/Theme.*      (410)    – синглтон: палитра, пресеты, QSS, настройки отображения
+    │   ├─ ParamForm.*    (444)    – форма параметров из реестра: поле + выпадающий список единиц, кнопка цвета для параметров-цветов
+    │   ├─ PropertiesPanel.*(211)  – правая панель «Элемент» (быстрая правка выбранного; у провода — длина и кнопка «Комментарий…»)
+    │   ├─ SimulationPanel.*(144)  – правая панель «Симуляция»: Сброс, Старт/Стоп, строка состояния, 3 ползунка
+    │   └─ DetachableTabBar.*(154) – полоса вкладок как в VS Code: вкладку можно перетащить в другое окно или оторвать в новое; `kind` 0 — схемы, 1 — карты Карно
+    ├─ scope/                     – осциллограммы: ScopeSource (95/77; отсчёты t, V, I — последние 4000 + свои ScopeSettings у каждого элемента, экспорт CSV),
+    │   │                           ScopePlot (466; рисование, шкалы, триггер, X-Y, информация), ScopeDialog (308; «Параметры осциллографа»),
+    │   │                           ScopeMenu (79; меню ПКМ), ScopeWidget (210; ScopeView, ScopeBoard — нижняя панель рядом/друг над другом,
+    │   │                           ScopeWindow — отдельное окно), ScopeItem (128; окошко на схеме с линией к элементу)
+    ├─ sim/                       – SimIssue.h (причина остановки), Preflight (175; проверки интерфейса), IssueLog (97; журнал), IssueBanner (61; плашка)
+    ├─ theme/Theme.*      (590)    – синглтон: палитра, пресеты, QSS, настройки отображения, шрифты (Geist/Inter, JetBrains Mono)
     ├─ util/
     │   ├─ CoreTypes.h             – ЕДИНСТВЕННОЕ место, где gui включает заголовки ядра
     │   └─ Units.*        (140)    – инженерные единицы: format(4700,"Ω") → "4.7 kΩ", parse("4.7k")
     └─ resources/                  – resources.qrc (:/images/logo.png|ico), icon.rc, images/
 ```
 
-Числа в скобках — строки в .cpp (ориентир по размеру). Всего ≈ 10.4 тыс. строк.
+Числа в скобках — строки в .cpp (ориентир по размеру). Всего ≈ 27.2 тыс. строк (core ≈ 3.1 тыс., gui ≈ 24.1 тыс.).
 
 ## 4. core — реестр элементов (общий контракт core ↔ gui)
 
@@ -96,11 +124,12 @@ ECSimulator/
 GUI строит из него меню, иконки, форму параметров и диалог свойств; ядро будет брать оттуда выводы и параметры.
 
 ```cpp
-struct ParamDef    { key, label, unit, defaultValue, minValue, maxValue, choices = nullptr, integer = false };
+struct ParamDef    { key, label, unit, defaultValue, minValue, maxValue, choices = nullptr, integer = false, color = false };
 struct ElementInfo { type, id, name, category, pinNames, params, chip = nullptr, dynamic = Dynamic::None };
 ```
 
 - Значения параметров — в СИ. `choices = "А|Б|В"` → перечисление (значение = индекс). `integer` — округлять.
+  `color` — значение это RGB как целое `0xRRGGBB`, в форме вместо поля — кнопка выбора цвета (параметр `glow`).
 - `id` — стабильный строковый идентификатор (для будущего формата файлов).
 - **Порядок `pinNames` — контракт:** вывод `i` в gui = вывод `i` в ядре.
 - `elementInfo(type)` — быстрый доступ по индексу + страховка от рассинхрона enum и таблицы.
@@ -161,6 +190,22 @@ chipInfo(T::DFlipFlop, "dff", "D-триггер", C::Digital, "D;D,>C|Q,/Q", { .
 Цепочка: `variantOf(info, getter)` → число-«вариант» → `layoutFor / pinCountFor / pinNamesFor`.
 Ядро и gui получают раскладку из одного места. Максимум выводов — 64 (`SymbolPainter::kMaxPins`).
 
+### 4.3а Расчёты «Печатных плат» (`core/include/govno/core/pcb/`)
+
+Чистые inline-функции без Qt, единицы — в имени параметра (длины в мм, частоты в Гц). Интерфейс (`gui/pcb`) только вводит числа и показывает
+результат. Источник чисел — калькуляторы Saturn PCB Toolkit V8.48 (скриншоты + справка); `core/tests/pcb_check.cpp` сверяет результат с экранными значениями.
+
+| Область | Что и по какой модели |
+|---|---|
+| Линии | микрополосок — Hammerstad–Jensen + толщина проводника + дисперсия Kobayashi; погружённый и полосковые — IPC-2141; копланарный волновод — Simons (эллиптические интегралы); дифф. пары — IPC-2141 (`Zdiff = 2·Zo·(1 − 0,48·e^(−0,96·S/H))` для наружных, `0,347·e^(−2,9·S/B)` для внутренних), `Kb = (Ze − Zo)/(Ze + Zo)`, `Kb′ = (Ze − Zodd)/(Ze + Zodd)`, `Lsat = tr·v/2` |
+| Ток | `I = k·ΔT^0,44·A^0,725`: IPC-2221 (k = 0,048 / 0,024) и IPC-2152 (k ≈ 0,0406, внутренний −10 %, «с поправками» — упрощённые множители), сечение с травлением (None / 1:1 / 2:1), сопротивление при 85 °C, скин-слой |
+| Переходные | `C = 1,41·Er·T·D1/(D2 − D1)`, `L = 5,08·h·(ln(4h/d) + 1)`, `Z = √(L/C)`, ток по сечению стакана `π·t·(d + t)`, тепловое сопротивление (k = 394 Вт/м·К) |
+| Прочее | зазоры IPC-2221 (табл. 6-1), падстеки, PDN (`C = 0,225·Er·A/d`), планарные катушки (модиф. Уилер), Ондердонк, AWG, сверла, винты, закон Ома, аттенюаторы, кварц/PPM |
+
+**Что воспроизведено точно, а что приблизительно** (отклонения от эталона): микрополосок `Zo` на 0,6 % выше, длина IPC-2251 на 1,5 % ниже; индуктивность планарной
+катушки на 0,05 %; формулы IPC-2152 «с поправками», broadside-пары, дифф. переходные и «пенёк» — оценочные модели, не копия закрытых формул эталона.
+Таблица зазоров IPC-2221 и значения для >500 В — справочные, сверять с действующей редакцией стандарта.
+
 ### 4.4 Как добавить новый элемент
 
 1. `ElementTypes.h`: значение в `enum class ElementType` (перед `Count_`) и **одна запись в `allElements()` в том же порядке**.
@@ -179,33 +224,45 @@ main.cpp ─ Theme::instance().load()/applyToApplication()
       ├─ стартовая страница (логотип, 4 кнопки)
       └─ EditorWindow (QMainWindow)                      signal backToMainMenu()
            ├─ меню: Файл · Правка · Элементы · Вид · Справка
-           ├─ узкая левая панель разделов (только значки: «Симулятор электронных цепей» / «Карты Карно»); быстрых инструментов нет — элементы через меню «Элементы» и ПКМ
-           ├─ EditorTabs (QTabWidget, вкладка = схема)
-           │    └─ CircuitView (QGraphicsView) ─ владеет ─ CircuitScene + QUndoStack
-           │          └─ CircuitItem × N
+           ├─ QStackedWidget: раздел 0 — EditorTabs, раздел 1 — KarnaughSection, раздел 2 — PcbToolkitSection (подвкладки в 3 ряда + правая панель настроек)
+           │    ├─ EditorTabs (QTabWidget c DetachableTabBar, вкладка = схема)
+           │    │    └─ CircuitView (QGraphicsView) ─ владеет ─ CircuitScene + QUndoStack
+           │    │          └─ CircuitItem × N (+ ScopeItem — осциллограммы, NoteItem — блоки комментариев проводов)
+           │    └─ KarnaughSection (свои вкладки KarnaughWidget)
            ├─ QUndoGroup (переключает стеки вкладок)
-           ├─ правый док: SimulationPanel + PropertiesPanel
-           └─ статус-строка: подсказка, позиция курсора, масштаб, число элементов
+           ├─ док-панели: «Разделы» (узкая, только значки: «Симулятор электронных цепей» / «Карты Карно» / «Печатные платы»), «Проекты» (ProjectPanel),
+           │    справа «Симуляция» (SimulationPanel) и «Элемент» (PropertiesPanel), снизу «Осциллограммы» (ScopeBoard) + «Журнал симуляции» (IssueLog)
+           │    Быстрых инструментов нет — элементы через меню «Элементы» и ПКМ
+           ├─ ProjectHub (синглтон, общий для всех окон) – реестр проектов и страниц
+           ├─ KarnaughLinks (синглтон) – связь элементов «Карта Карно» со страницами раздела карт
+           └─ статус-строка: подсказка, число элементов, позиция курсора, масштаб
 ```
 
 ### 5.1 Ключевые классы
 
 | Класс | Роль | Важное |
 |---|---|---|
-| `MainWindow` | стартовый экран ↔ редактор | «Открыть схему…» — заглушка (сообщение «появится вместе с ядром») |
-| `EditorWindow` | контейнер редактора | `newTab`, `closeTab/removeTab/renameTab/duplicateTab/clearTab`, `showTabMenu`, `showContextMenu`, `openElementDialog`, `fillElementMenu`, `simulationPanel()`; Открыть/Сохранить → `showNotYet()` |
-| `CircuitView` | ввод и правка | режимы `setSelectMode / setPlaceMode(type, routed)`, `Drag {None, Pan, Rubber, MoveItems, MoveEndpoint, Place}`, copy/cut/paste, `snapshot/loadSnapshot` (`ItemData`), `rotateSelection/flipSelection`, `toggleItems`, `toggleDipSwitch`, `setItemParam(s)/setItemText`, зум и `fitToContent`, таймер анимации тока |
-| `CircuitScene` | сетка и связность | `kGrid = 16`, `snap()`, ленивый `rebuild()` (union-find по совпадению точек выводов), `connectionCount(p)`, «почти-касания», `tickFlow(dt)`, `clearElectricalState()` |
-| `CircuitItem` | провод/элемент | геометрия `p1, p2, flip` (на сетке); выводы из `SymbolPainter::spec()`; `m_params` (QMap ключ→СИ); `m_variant`; `connectionPoints()`; `setElectrical(pinV, current)` — вход для ядра; `isToggle/hasProperties/hasParts/partAt`; `wheelKey/wheelStep` |
+| `MainWindow` | стартовый экран ↔ редактор | «Создать схему» → `showEditor(true)`; «Открыть проект…» — файловый диалог `*.govno` → `EditorWindow::openProjectFile`; заголовок окна = имя активного проекта |
+| `EditorWindow` | контейнер редактора | `newTab/newKarnaughTab`, `closeTab/removeTab/renameTab/duplicateTab/clearTab`, `showTabMenu`, `showContextMenu`, `openElementDialog`, `fillElementMenu`, `simulationPanel()`; проекты: `newProject/openProject/openProjectFile/saveProject/closeProject/deleteProject`; перенос вкладок: `takeTab/adoptTab/detachTab`; симуляция: `onSimulationToggled`, `stopSimulationWithIssues`, `recheckIssues`. `showNotYet()` — мёртвый код (нигде не вызывается) |
+| `ProjectHub` / `ProjectFile` | проекты | `ProjectHub::instance()` — реестр проектов и страниц (`attach/projectOf/kindOf/nameOf/uniqueName`, сигнал `changed`); `ProjectFile::save/load` — JSON `.govno` (версия 1: `version, name, schemes[{name, mmPerCell?, items[{type, a, b, flip?, params?, text?, cells?, link?, note?}]}], maps[{name, width, height, cells, names?}]`); неизвестные типы элементов при загрузке пропускаются |
+| `DetachableTabBar` | вкладки между окнами | сигналы `detachRequested, tabDropped, dragEnded`; `kind` (0 схемы / 1 карты); единственную вкладку окна можно унести в другое окно, но не «оторвать» |
+| `CircuitView` | ввод и правка | режимы `setSelectMode / setPlaceMode(type, routed)`, `Drag {None, Pan, Rubber, MoveItems, MoveEndpoint, Place}`, copy/cut/paste, `snapshot/loadSnapshot` (`ItemData`), `rotateSelection/flipSelection`, `toggleItems`, `toggleDipSwitch`, `setItemParam(s)/setItemText`, `setItemNote/setItemLink/setMmPerCell`, зум и `fitToContent`, таймер анимации тока; `noteAt`, `refreshHoverTip`, сигнал `noteEditRequested` |
+| `CircuitScene` | сетка и связность | `kGrid = 16`, `snap()`, ленивый `rebuild()` (union-find по совпадению точек выводов), `connectionCount(p)`, «почти-касания», `tickFlow(dt)`, `clearElectricalState()`; `traceOf(wire)` / `rebuildTraces()` — трассы и дифф. пары (`Trace {wires, lengthPx, pair, pairSize, longestPx, shortestPx, lagging}`), `diffPairs()`, `nextFreePair()`, `mmPerCell()` |
+| `CircuitItem` | провод/элемент | геометрия `p1, p2, flip` (на сетке); выводы из `SymbolPainter::spec()`; `m_params` (QMap ключ→СИ); `m_variant`; `connectionPoints()`; `setElectrical(pinV, current)` — вход для ядра; `isToggle/hasProperties/hasParts/partAt`; `wheelKey/wheelStep`; `note()/setNote()`, `hoverTip()`, `noteFooter()`, `traceMark()`, `traceLengthMm()`, `traceSkewMm()`, `pcbWidthMm()`, `diffPair()`, `link()/varNames()` |
 | `SymbolPainter` (namespace) | рисование и геометрия | `Spec / PinSpec{u, v, du, side}`, `spec(type, variant)`, `pinLocal`, `normalizeEnd`, `isValidGeometry`, `partAt`, `paint(PaintContext)`, `icon()` |
 | `KarnaughWidget` / `KarnaughCanvas` | вкладка-калькулятор | открывается из Файл → «Новая карта Карно» и из ПКМ по полосе вкладок; не схема, поэтому `EditorWindow::removeTab/closeTab/closeTabsWhere` работают с любым `QWidget`; ширина/высота 1…1024, оси кодом Грея, расчёт в `QThreadPool` с отменой |
-| `Commands` | undo | `AddItemsCommand`, `RemoveItemsCommand`, `GeometryCommand` (склеиваемый, id 0x6401), `ChangeTextCommand`, `ChangeParamCommand` (склеиваемый, id 0x6402) |
+| `Commands` | undo | `AddItemsCommand`, `RemoveItemsCommand`, `GeometryCommand` (склеиваемый, id 0x6401), `ChangeTextCommand`, `ChangeCellsCommand` (клетки карты Карно), `ChangeParamCommand` (склеиваемый, id 0x6402), `ChangeNoteCommand` (склеиваемый, id 0x6403), `ChangeScaleCommand`, `ChangeLinkCommand` (привязка карты Карно: старое состояние восстанавливается при отмене) |
 | `ParamForm` | форма параметров | `UnitCombo`-подобный список единиц справа; смена единицы пересчитывает число; сигнал `valueEdited(key, value)`; `suffixHelp()` |
 | `PropertiesPanel` | панель «Элемент» | применяет сразу (с отменой); кнопка «Все характеристики…» → `detailsRequested` |
-| `SimulationPanel` | панель «Симуляция» | сигналы `resetClicked, runningChanged, simulationSpeedChanged, currentSpeedChanged, powerBrightnessChanged` — **сюда подключится ядро** |
-| `ElementDialog` | окно «Свойства» | все параметры + текст надписи; применяет вызывающий код после OK |
+| `SimulationPanel` | панель «Симуляция» | сигналы `resetClicked, runningChanged, simulationSpeedChanged, currentSpeedChanged, powerBrightnessChanged`; `setStatus(Idle/Running/Error)`, `setStopped(причина)`. Сейчас подключены `runningChanged` (→ `onSimulationToggled`), `resetClicked` и `currentSpeedChanged` (скорость точек тока); `simulationSpeedChanged` и `powerBrightnessChanged` — **не подключены, их возьмёт ядро** |
+| `ElementDialog` | окно «Свойства» | все параметры + текст надписи; конструктор `(item, parent, mapNames)` — у карты Карно добавляется список «Связь с картой Карно» (`hasLink()/link()`); применяет вызывающий код после OK |
+| `WireNoteDialog` | окно «Провод: комментарий и дифф. пара» | текст, «показывать блоком», ширина на плате (мм, 0 — не задана), галочка и номер дифф. пары (`pairNumber()`, 0 — снята); `note()` сохраняет смещение блока и `autoText`, если текст не менялся |
+| `WireNote` / `NoteItem` | комментарий провода | см. 8.3 |
+| `KarnaughLinks` | связь элемента «Карта Карно» с картой | см. 8.4 |
 | `SettingsDialog` | настройки вида | применяются сразу через `Theme` |
-| осциллограммы | ПКМ по элементу → «Осциллограмма»: на схему (`CircuitView::addScope`) или в нижнюю панель (`EditorWindow::showScopeInDock`). Данные идут из `CircuitItem::setElectrical` + `CircuitItem::setSimTime`; пока ядра нет, графики пустые |
+| осциллограммы | ПКМ по элементу → «Осциллограмма»: «Прикрепить к схеме» (`CircuitView::addScope`) или «Показать в нижней панели» (`EditorWindow::showScopeInDock`); оттуда же — в отдельное окно (`detachScope`) и обратно. Данные идут из `CircuitItem::setElectrical` + `CircuitItem::setSimTime` в `ScopeSource`; пока ядра нет, графики пустые |
+| `PcbToolkitSection` | раздел «Печатные платы» | `showPage(i)`; страницы наследуют `PcbPage` (`config()` — какие блоки правой панели нужны, `optionsWidget()` — свои группы вместо «Плоскости/Слоя», `infoItems()`, `solve()`, `receiveValue()`); общие настройки приходят как `PcbContext` из `PcbOptions`; страницы общаются сигналом `sendValue(pageId, key, value)` (Er эфф. → Длина волны, Zdiff → Переходные); `setTrace(PcbTrace)` — связь с проводом схемы, сигналы `traceCommentRequested / traceShowRequested / traceUnlinked`; справка «?» — `PcbPage::helpHtml()` |
+| `Preflight` / `IssueLog` / `IssueBanner` | проверки и остановка | `Preflight::check(scene)` → `QVector<SimIssue>` (сейчас одно правило — резистор перед индикатором); журнал «Журнал симуляции» кликабелен (`issueActivated` → `CircuitView::focusItem`); плашка на схеме — `CircuitView::showStopBanner` |
 | `Theme` | синглтон оформления | `Palette`, пресеты **Лаборатория («цифровая лаборатория»: графит #121315, текстолит #1a1c1f, янтарь #ff9f0a для выбора, зелёный #00e676 для сигналов и фокуса ввода; по умолчанию), Графит, Океан, Чисто чёрный, Чисто белый, Свой цвет**; свой акцент; `GridStyle {Dots, Lines, None}`; `voltageColor(V)`; QSS из токенов `@bg@ @panel@ @accent@ @onAccent@…` |
 | `Units` (namespace) | единицы | `format(value, unit)`, `parse(text, unit, &out)` |
 
@@ -221,8 +278,10 @@ main.cpp ─ Theme::instance().load()/applyToApplication()
 
 ### 5.3 Настройки (`QSettings`)
 
-`theme/preset`, `theme/customBg`, `theme/accent`, `theme/grid`, `theme/labels`, `theme/junctions`, `theme/nearMiss`,
-`sim/speed`, `sim/current`, `sim/power`.
+`theme/preset`, `theme/customBg`, `theme/accent`, `theme/grid`, `theme/labels`, `theme/junctions`, `theme/nearMiss`, `theme/lengthMarks` (метки дифф. пар: штрихи и красный),
+`sim/speed`, `sim/current`, `sim/power`; раздел «Печатные платы»: `pcb/imperial`, `pcb/microns`, `pcb/manualCopper`, `pcb/baseCu`,
+`pcb/plating`, `pcb/plane`, `pcb/external`, `pcb/material`, `pcb/er`, `pcb/tg`, `pcb/rise`, `pcb/ambient`, `pcb/ipc`, `pcb/etch`,
+`pcb/viaHeightOff`, `pcb/aspectThrough`, `pcb/aspectMicro`, `pcb/page` (последняя открытая подвкладка).
 
 ## 6. Управление
 
@@ -248,18 +307,18 @@ main.cpp ─ Theme::instance().load()/applyToApplication()
 | G D T O K | земля, диод, n-p-n, ОУ, выключатель |
 | Esc | отмена операции → режим выбора → снять выделение |
 | Ctrl+R / Ctrl+Shift+R / Ctrl+F | повернуть / назад / отразить |
-| F2, двойной клик | окно «Свойства» |
+| F2, двойной клик | окно «Свойства» (у провода — «Комментарий и дифф. пара») |
 | F1 | справка по управлению |
 | Пробел или ЛКМ-клик по символу | переключить ключ / кнопку / переключатель |
 | Ctrl+Z, Ctrl+Y / Ctrl+Shift+Z | отмена / повтор |
 | Ctrl+C / X / V / A, Del / Backspace | правка |
-| Ctrl+T / Ctrl+W | новая / закрыть вкладку (закрытие последней — в главное меню) |
-| Ctrl+O / Ctrl+S | открыть / сохранить — **заглушки** |
+| Ctrl+T / Ctrl+W | новая схема / закрыть вкладку (закрытие последней страницы — в главное меню, у оторванного окна — закрытие окна) |
+| Ctrl+O / Ctrl+S / Ctrl+Shift+S | открыть проект / сохранить проект / сохранить проект как (работают, формат `.govno`) |
 | Ctrl+= / Ctrl+− / Ctrl+0 / Ctrl+9 | масштаб + / − / 100 % / вписать |
 
 **Мышь:** колесо — масштаб; СКМ — панорама; ПКМ по пустому месту — все элементы по категориям; ПКМ по элементу —
 меню действий; ПКМ по вкладке — новая/дублировать/переименовать/очистить/закрыть (остальные, справа, все);
-двойной клик по вкладке — переименовать; СКМ по вкладке — закрыть.
+двойной клик по вкладке — переименовать; СКМ по вкладке — закрыть. Провод: двойной клик — комментарий; наведение на провод с комментарием — подсказка с текстом; блок комментария тянется мышью, «×» его скрывает; ПКМ по проводу — «Комментарий и дифф. пара…», «Дифференциальная пара ▸» (новая / №k / убрать), «Показывать комментарий блоком», «Рассчитать в «Печатных платах»».
 
 **Колесо над элементом** меняет главный параметр (R, C, L — ряд E12; напряжения/токи/частоты — 1-1.5-2-2.5-3-4-5…;
 движок и освещённость — 5 %). У переменных элементов колесо двигает `position`, **Shift+колесо** — номинал/частоту,
@@ -290,7 +349,7 @@ main.cpp ─ Theme::instance().load()/applyToApplication()
 | Масштаб напряжения для цвета | `Theme::setVoltageScale(V)`, `voltageColor(V)` |
 | Анимация тока | `CircuitView::setFlowAnimation(on)`, `CircuitScene::tickFlow(dt)`, `CircuitItem::setFlowSpeed` |
 | Старт/стоп/скорость/сброс | сигналы `SimulationPanel` через `EditorWindow::simulationPanel()` |
-| Сериализация | `CircuitView::snapshot()/loadSnapshot()` + `ItemData` — готовая основа для save/load |
+| Сериализация | в gui уже есть: `CircuitView::snapshot()/loadSnapshot()` + `ItemData` → `ProjectFile` (`.govno`). Набросок `saveCircuit/loadCircuit` ниже — для будущей модели ядра; формат проекта его не заменяет |
 
 Набросок API ядра (цель):
 
@@ -327,15 +386,30 @@ bool loadCircuit(Circuit&, const std::string& path);
   (нижняя панель, двойной клик по строке — выделить элемент). Пока симуляция остановлена или идёт, схема перепроверяется при каждом изменении;
   когда проблема исправлена, подсветка и плашка снимаются сами.
 - **Куда подключается ядро:** `EditorWindow::onSimulationToggled(true)` (после проверок интерфейса — передать схему и начать расчёт),
-  результаты — `CircuitItem::setElectrical`, `setLight`, `setSimTime`.
+  результаты — `CircuitItem::setElectrical`, `setLight`, `setReadout`, `setSimTime`. Сейчас `onSimulationToggled` только
+  прогоняет `Preflight::check` по текущей вкладке, включает анимацию точек тока во всех вкладках и пишет «Симуляция запущена» в журнал.
 
 ### 8.2 Карта Карно как элемент и проект
 
 - **Элемент «Карта Карно»** (`ElementType::KarnaughMap`, категория «Логика», `Dynamic::Karnaugh`): таблица `width × height` (1…16) с подписями кода Грея, диагональ с именами переменных в углу и окно «F = …» под таблицей. Размер и «Что выводить» (`output`: 0 СДНФ, 1 СКНФ, 2 минимальная ДНФ, 3 минимальная КНФ) — в свойствах. Клик ЛКМ по клетке выделенной карты меняет её 0 → 1 → X (с отменой, `ChangeCellsCommand`; первый щелчок по невыделенной карте только выделяет её, чтобы клетки не менялись случайно); работает при любом повороте/отражении (`partAt`). Параметр `pins` («Выводы»): «Убрать» делает карту только таблицей для кликов — у элемента нет ни одного вывода (`pinCount() == 0`, ручек и точек соединения нет; бит 16 варианта).
 - **Контракт с ядром.** Выводы: A, B, … (сначала `bits(height)` переменных по строкам, затем `bits(width)` по столбцам) и выход F. Клетки: `CircuitItem::cells()` — 16×16 байт по строкам (`row * 16 + col`; 0, 1, 2 = X), видна верхняя левая часть `height × width`. Подписи строк и столбцов — код Грея индекса: ядру нужно перевести значение входных бит в индекс обратным кодом Грея. X — безразличное значение (ядро вправе выдать 0 или 1). `vhigh`/`threshold` — как у остальной логики.
 - **Формула** считается в gui (`Karnaugh::solve`) при любой правке клеток/параметров и показывается в окне; результат хранит `CircuitItem::karnaughFormula()`.
-- **Проекты.** В приложении открыто сразу несколько проектов (`ProjectHub`): «Новый проект», «Новый проект 2»… Каждая схема и карта Карно принадлежит проекту; вкладки всех проектов лежат на общих полосах (при двух и более проектах подпись вкладки «Схема 1 · Имя проекта»). Панель «Проекты» слева (рядом с разделами) показывает дерево всех открытых проектов; жирным — активный, «•» — есть несохранённые изменения, «(скрыт)» — вкладки проекта убраны с полос (данные остаются). Меню Файл: Новый / Открыть / Сохранить / Сохранить как / Переименовать / Закрыть проект (действуют на активный), ПКМ по проекту в дереве — то же и «Открыть в проводнике», «Скрыть», «Удалить проект» (удаляет и файл с диска после подтверждения). Один файл открывается один раз: повторное открытие просто переходит к проекту. Файл `.govno` — JSON: `schemes[{name, items[{type, a, b, flip, params, text, cells}]}]`, `maps[{name, width, height, cells, names}]`. Несохранённость схемы — `QUndoStack::isClean()`.
+- **Проекты.** В приложении открыто сразу несколько проектов (`ProjectHub`): «Новый проект», «Новый проект 2»… Каждая схема и карта Карно принадлежит проекту; вкладки всех проектов лежат на общих полосах (при двух и более проектах подпись вкладки «Схема 1 · Имя проекта»). Панель «Проекты» слева (рядом с разделами) показывает дерево всех открытых проектов; жирным — активный, «•» — есть несохранённые изменения, «(скрыт)» — вкладки проекта убраны с полос (данные остаются). Меню Файл: Новый / Открыть / Сохранить / Сохранить как / Переименовать / Закрыть проект (действуют на активный), ПКМ по проекту в дереве — то же и «Открыть в проводнике», «Скрыть», «Удалить проект» (удаляет и файл с диска после подтверждения). Один файл открывается один раз: повторное открытие просто переходит к проекту. Файл `.govno` — JSON: `schemes[{name, mmPerCell?, items[{type, a, b, flip, params, text, cells, link?, note?}]}]` (`note` — `{text, shown, dx, dy, auto}`; у проводов в `params` скрытые `pcbWidth` и `diffPair`), `maps[{name, width, height, cells, names}]`. Несохранённость схемы — `QUndoStack::isClean()`.
 - **Несколько окон.** Любую вкладку схемы или карты можно вытащить за полосу вкладок: откроется новое окно (`EditorWindow standalone`) с этой вкладкой, страница остаётся в своём проекте (в дереве пометка «в отдельном окне»). Вкладку можно бросить на полосу другого окна; схема не принимается полосой карт и наоборот (`DetachableTabBar::kind`). Закрытие отрывного окна возвращает его вкладки в основное окно; пустое окно закрывается само.
+
+### 8.3 Комментарии проводов, трассы и связь с калькуляторами
+
+- **Комментарий провода** (`WireNote {text, shown, offset, autoText}`, `CircuitItem::note()`; правка — `CircuitView::setItemNote` → `ChangeNoteCommand`, склеиваемая отмена id 0x6403). Двойной клик по проводу, F2 или ПКМ → «Комментарий…» открывают `WireNoteDialog`: текст, «показывать блоком», ширина проводника на плате (мм, 0 — не задана; хранится скрытым параметром `pcbWidth`). Пока блок скрыт, текст виден в подсказке при наведении (`CircuitItem::hoverTip`). Показанный блок — `NoteItem` (дочерний элемент провода): карточка с текстом и строкой «L = … мм · дифф. пара №k · короче на X мм», пунктирная линия к середине провода, «×» скрывает блок, перетаскивание запоминает смещение (с отменой). Пункт «Показывать комментарий блоком на схеме» — в меню провода.
+- **Дифференциальная пара — явная пометка** (параметр провода `diffPair` — номер пары, 0 — не в паре; `CircuitItem::diffPair()`). Совпадение длин ничего не значит: проводам, которых не пометили, ни штрихов, ни красного не достаётся. Пометить можно тремя способами: галочка «Этот провод — часть дифференциальной пары» + «Номер пары» в окне «Комментарий и дифф. пара…» (двойной клик, F2); ПКМ по проводу → «Дифференциальная пара ▸» → «Новая пара №k» / «Пара №k» / «Убрать из дифф. пары» (действует на все выделенные провода — выделите по одному проводу от каждого проводника пары, Shift+клик, и выберите «Новая пара»); и то и другое — через `EditorWindow::assignDiffPair`, одно действие отмены.
+- **Проводник пары — вся трасса** (`CircuitScene::rebuildTraces()`, вызывается после каждого `rebuild` и при смене `diffPair`): провода, сходящиеся ровно по два в точке (без вывода элемента и ответвления), склеиваются в цепочку — прямую, «уголком», зигзагом или квадратом из четырёх проводов; такая цепочка считается одним проводником. Метка ставится на весь проводник сразу (на все его провода), а номер пары у трассы — наименьший ненулевой `diffPair` среди её проводов: достроили провод к помеченной трассе — он сразу в паре. Трассы с одним номером — одна пара: длины сравниваются (допуск полпикселя), **проводник короче самого длинного рисуется красным целиком** (`TraceMark::lagging`). Если удлинить один проводник, красным станет второй; в подписи — «короче на X мм» / «длиннее на X мм» / «длины равны» / «второго проводника нет». На самом длинном проводе каждой трассы рисуются штрихи по номеру пары: 1, 2, 3… (не больше 8). Отключается в «Настройках» (`theme/lengthMarks`: штрихи и красный). Длина в мм = длина в px / 16 × `mmPerCell` (по умолчанию 1 мм на клетку; Вид → «Масштаб проводников (мм на клетку)…», `ChangeScaleCommand`; хранится в схеме как `mmPerCell`).
+- **Связь с калькуляторами.** ПКМ по проводу → «Рассчитать в «Печатных платах»» → «Полоса и длина», «Импеданс», «Свойства проводника», «Дифф. пары» или «Ток плавления» (`EditorWindow::openPcbForWire`). Трасса передаётся разделу как `PcbTrace` (имя, длина, ширина, номер пары, число проводников, рассогласование): над страницами появляется панель «Провод · L · W · дифф. пара №k · короче на X мм» с флажком «Записывать расчёт в комментарий (пока он пуст)» и кнопками «В комментарий», «Показать на схеме», «Отвязать». Страницы, использующие трассу (`PcbPage::usesTrace`), подставляют длину и ширину в свои поля и дополняют «Информацию»; итог расчёта — `traceSummary()`. Автозапись (через 450 мс после изменения) идёт в комментарий, только если он пуст или сам был создан расчётом (`autoText`): текст пользователя не затирается; кнопка «В комментарий» при чужом тексте спрашивает «Заменить / Добавить в конец / Отмена». Страница «Дифф. пары» для помеченной пары добавляет в «Информацию» и в запись комментария номер пары и рассогласование длин. Пока связь жива, длина обновляется при правке схемы (`topologyChanged`, `scaleChanged` → `refreshPcbTrace`).
+- **Справка «?».** В правом верхнем углу каждой из 19 страниц: при наведении — краткая подсказка (первый абзац), по щелчку — окно «Справка: …» (как пользоваться, что получается, замечания, связь со схемой). Тексты — `gui/pcb/PcbHelp.cpp`, `pcbHelpHtml(pageId)`.
+
+### 8.4 Связь элемента «Карта Карно» с картой раздела
+
+- ПКМ по элементу → «Связать с картой Карно» или окно «Свойства» (список «Связь с картой Карно»): элемент привязывается к странице раздела карт по имени (`CircuitItem::link()`, в проект пишется как `link`; переименование страницы подхватывается — `ProjectHub::pageRenamed`). Привязка — `ChangeLinkCommand`: отмена возвращает прежние клетки, размер и привязку.
+- Двусторонняя синхронизация — синглтон `KarnaughLinks` (`tools/KarnaughLinks.*`): карта → элемент (клетки, размер до 16×16, имена переменных; сигнал `KarnaughWidget::stateChanged`), элемент → карта (клик по клетке, ширина/высота; сигнал `CircuitScene::karnaughChanged`). Зацикливание гасит флаг `m_busy`. Если к одной карте привязано несколько элементов, обновляются все; при открытии проекта связи сверяются (`syncProject`).
+- Ограничения: элемент вмещает 16×16 — у большей карты виден фрагмент, размер страницы с элемента не меняется; имена переменных попадают в шапку и формулу, подписи выводов остаются A, B, …; правка со стороны карты не входит в историю отмены схемы и не помечает проект изменённым.
 
 ### Компоновка выводов
 
@@ -356,21 +430,39 @@ bool loadCircuit(Circuit&, const std::string& path);
 **Готово (gui):** стартовое меню, редактор с вкладками, бесконечная сетка, масштаб, панорама, 181 элемент
 с символами, провода (в т.ч. трассированные), перенос/поворот/отражение, выделение рамкой, copy/cut/paste,
 дублирование вкладки, undo/redo, окно свойств, панели «Симуляция» и «Элемент», единицы, колесо над элементом,
-красные «почти-соединения», темы и настройки, контекстные меню.
+красные «почти-соединения», темы и настройки, контекстные меню; **проекты** `.govno` (открыть/сохранить/сохранить как,
+несколько проектов, панель «Проекты»); **карты Карно** (раздел, элемент, решатель); отрывные окна и перенос вкладок;
+**осциллограммы** (интерфейс: на схеме, в нижней панели, в отдельном окне, параметры, экспорт CSV — без данных до появления ядра);
+проверки перед запуском, журнал и плашка остановки симуляции; **раздел «Печатные платы»** — 19 калькуляторов (полоса и длина проводника,
+импеданс, свойства проводника, конвертер, дифф. пары, PDN, планарные катушки, PPM/кварц, тепло, переходные, длина волны, XL/XC, встроенные резисторы,
+эффективная Er, ток плавления, механика, зазоры, закон Ома, падстек), общая панель настроек, единицы мм/мил/мкм, печать, окно «Параметры», справка «?» на каждой вкладке; **комментарии проводов** (подсказка или блок с линией-выноской), **дифференциальные пары** (явная пометка проводников и цепочек проводов, штрихи по номеру пары, красный проводник короче напарника), масштаб «мм на клетку», **связь проводов с калькуляторами** (результат расчёта — в пустой комментарий), **связь элемента «Карта Карно» с картой раздела** (в обе стороны).
 
 **Не готово:**
-- **core:** нет модели цепи, узлов, решателя MNA, save/load, `CORE_API_VERSION`, тестов.
-- `SimulationPanel` ничего не запускает; цвета проводов и точки тока ждут `setElectrical`.
+- **core:** нет модели цепи, узлов, решателя MNA, save/load, `CORE_API_VERSION`; из тестов есть только `pcb_check` (математика печатных плат).
+- **Печатные платы:** часть формул оценочная (см. 4.3а) — IPC-2152 «с поправками», broadside-пары, дифф. переходные, граничная длина IPC-2251; нет кнопок
+  «ссылки на сайт» оригинала (вместо них встроенные таблицы); состояние страниц между запусками не сохраняется (только настройки правой панели).
+- **Связи схемы:** привязка раздела «Печатные платы» к проводу в проект не сохраняется (сохраняются комментарий, ширина и масштаб); у связанной карты Карно имена переменных попадают в шапку и формулу, но не в подписи выводов; правка карты не входит в историю отмены схемы; карта больше 16×16 показывается на элементе фрагментом.
+- **Дифф. пары:** при копировании провода номер пары копируется вместе с ним (вставленные провода попадают в ту же пару — перенумеруйте); допуска на рассогласование нет (любая разница длин больше полпикселя — красный); если в паре больше двух проводников, сравнение идёт с самым длинным; штрихов не больше 8 (номера пар с 9-й различаются только в подписи).
+- `SimulationPanel` ничего не считает: «Старт» только запускает проверки и анимацию точек тока; цвета проводов и значения
+  ждут `setElectrical`, свечение — `setLight`, показания приборов и экранов — `setReadout`. Ползунки скорости симуляции и яркости мощности ни к чему не подключены.
 - Осциллограммы в файл проекта не попадают (их порождает симуляция); оторванные окна при открытии проекта собираются в основное.
 - Нет авто-разрезания провода при касании концом его середины (такой конец только краснеет).
-- Нет редактора содержимого RAM/ROM (только размер), подсхем, осциллографа/графиков.
+- Нет редактора содержимого RAM/ROM (только размер) и подсхем.
+- Из проверок интерфейса есть только правило «резистор перед индикатором».
 - Символы, которых нет в ГОСТ 2.721-74, нарисованы по общепринятым обозначениям.
 
 ## 10. Замечания по репозиторию
 
-1. В корне лежат остатки старой версии: `icon.rc`, `images/logo.png|ico` — сборкой не используются (дубли `gui/resources`). Можно удалить.
-2. Старые корневые файлы (`MainWindow.*`, `main.cpp`, `pin.*`, `wire.*`, `resources.qrc`, `PROJECT_MAP.md`) удалены, но удаление ещё не закоммичено.
-3. `core/CMakeLists.txt` — пока INTERFACE; правило: ядро не зависит от Qt Widgets/Gui.
+1. В корне лежат остатки старой версии: `icon.rc`, `images/logo.png|ico` — сборкой не используются, побайтово совпадают с `gui/resources`. Можно удалить.
+2. `README.md` в корне — точная копия `map/PROJECT_MAP.md`; при правке карты обновлять оба файла (или оставить один).
+3. В этой копии папки (`ECSimulator-main`) нет `.git`; прежняя заметка про незакоммиченное удаление старых корневых файлов (`MainWindow.*`, `main.cpp`, `pin.*`, `wire.*`, `resources.qrc`) относилась к исходному репозиторию.
+4. `core/CMakeLists.txt` — пока INTERFACE; правило: ядро не зависит от Qt Widgets/Gui.
+5. Файлы репозитория — с окончаниями строк **LF**. На Windows `python open(..., 'w')` без `newline=''` пишет CRLF — править через `Edit`
+   или открывать с `newline=''`.
+6. Сборка и проверка вне репозитория (Qt 6.11.1 MinGW в `D:\Program\Qt`): `cmake -S . -B <build> -G Ninja -DCMAKE_PREFIX_PATH=D:/Program/Qt/6.11.1/mingw_64
+   -DGOVNO_BUILD_TESTS=ON`, затем `cmake --build <build>` и `ctest`.
+7. Мелочи в коде: `EditorWindow::showNotYet()` нигде не вызывается (устарел вместе с заглушками Открыть/Сохранить);
+   тексты «О программе» и подвал стартового экрана («GUI-прототип · расчёт цепей появится вместе с ядром») ещё про прототип.
 
 ## 11. Дорожная карта
 
@@ -378,8 +470,9 @@ bool loadCircuit(Circuit&, const std::string& path);
 2. Подключить `SimulationPanel` к ядру, передавать результаты в `setElectrical`.
 3. ~~Открыть/Сохранить~~ — готово: проект целиком (`ProjectFile`), формат расширяем (поле `version`).
 4. Явные соединения вместо геометрических, авто-разрезание проводов.
-5. Осциллограф/графики, редактор RAM/ROM, подсхемы.
-6. Тесты ядра (CTest, без GUI), версия API.
+5. Заполнить осциллограммы данными ядра (интерфейс готов), редактор RAM/ROM, подсхемы.
+6. Тесты ядра (CTest, без GUI): математика печатных плат уже покрыта (`pcb_check`), дальше — `Circuit`/`Simulator`; версия API.
+7. «Печатные платы»: сохранение состояния страниц и привязки к проводу в проект, уточнение оценочных формул по стандартам; расчёт задержек и согласования по длинам трасс из схемы — в ядре.
 
 ## 12. Как работать с этим файлом
 

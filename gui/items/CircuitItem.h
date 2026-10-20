@@ -7,10 +7,32 @@
 #include <QPoint>
 #include <QRectF>
 #include <QString>
+#include <QStringList>
 #include <QVector>
 
+#include "items/NoteItem.h"
+#include "items/WireNote.h"
 #include "scope/ScopeSource.h"
 #include "util/CoreTypes.h"
+
+// Что сцена знает о трассе (цепочке проводов от вывода до вывода), в которую входит провод: полная длина и
+// принадлежность дифференциальной паре. Пару задаёт пользователь (параметр провода «diffPair» — её номер);
+// у номера k на проводе рисуется k штрихов. Трассы одной пары сравниваются по длине: короткая — красная.
+struct TraceMark {
+    double lengthPx = 0;                   // длина всей трассы, единицы сцены
+    int pair = 0;                          // номер дифф. пары, 0 — провод не в паре
+    int pairSize = 1;                      // сколько трасс (проводников) в паре
+    double longestPx = 0;                  // самая длинная и самая короткая трасса пары
+    double shortestPx = 0;
+    bool lagging = false;                  // короче самой длинной трассы пары: рисуется красным
+    bool carrier = false;                  // штрихи рисует именно этот провод (самый длинный в трассе)
+    bool operator==(const TraceMark &o) const
+    {
+        return qFuzzyCompare(lengthPx + 1.0, o.lengthPx + 1.0) && pair == o.pair && pairSize == o.pairSize
+               && qFuzzyCompare(longestPx + 1.0, o.longestPx + 1.0) && qFuzzyCompare(shortestPx + 1.0, o.shortestPx + 1.0)
+               && lagging == o.lagging && carrier == o.carrier;
+    }
+};
 
 // Один графический элемент схемы: провод или компонент любой сложности.
 //
@@ -58,6 +80,12 @@ public:
     const QVector<quint8> &cells() const { return m_cells; }
     void setCells(const QVector<quint8> &cells);
     const QString &karnaughFormula() const { return m_formula; }
+    // Связь с картой Карно из раздела «Карты Карно» (имя карты в том же проекте; пусто — нет связи).
+    // Данные карты показываются на схеме, а правки клеток и размера на схеме уходят в карту (см. tools/KarnaughLinks).
+    const QString &link() const { return m_link; }
+    void setLink(const QString &name) { m_link = name; }
+    const QStringList &varNames() const { return m_varNames; }          // имена переменных из связанной карты
+    void setVarNames(const QStringList &names);
     int  partAt(const QPointF &scenePos) const;            // номер клавиши/переключателя под точкой (1…N), 0 — мимо
     // Параметр, который меняется колесом мыши над элементом (пустая строка — такого нет).
     // secondary — вариант с Shift (номинал у переменных элементов, частота у источников).
@@ -100,6 +128,21 @@ public:
     // Текст надписи (только у элемента «Надпись»).
     const QString &text() const { return m_text; }
     void setText(const QString &t);
+
+    // --- комментарий и длина провода -------------------------------------------------------------
+    const WireNote &note() const { return m_note; }
+    void setNote(const WireNote &n);                       // создаёт или убирает блок на схеме
+    NoteItem *noteItem() const { return m_noteItem; }
+    QPointF midpoint() const { return QPointF(m_p1 + m_p2) / 2.0; }
+    const TraceMark &traceMark() const { return m_trace; }
+    void setTraceMark(const TraceMark &t);                 // вызывает сцена при пересчёте трасс
+    double traceLengthMm() const;                          // длина всей трассы в мм (по масштабу схемы)
+    double pcbWidthMm() const { return param(QStringLiteral("pcbWidth")); }   // ширина на плате, 0 — не задана
+    QString hoverTip() const;                              // подсказка при наведении (пусто — не показывать)
+    int diffPair() const { return qRound(param(QStringLiteral("diffPair"))); }   // номер пары, поставленный на этом проводе (0 — нет)
+    double traceSkewMm() const;                            // на сколько трасса короче (−) или длиннее (+) остальных в паре, мм
+    QString noteFooter() const;                            // строка «L = … мм · дифф. пара №k · …» под текстом блока
+    QString traceName() const;                             // для связи с расчётами: первая строка комментария или «Провод»
 
     // --- состояние отображения ------------------------------------------
     void setPreview(bool on);
@@ -170,6 +213,12 @@ private:
     bool m_flip = false;
     QMap<QString, double> m_params;
 
+    WireNote m_note;
+    QPointer<NoteItem> m_noteItem;
+    void retraceScene();
+    TraceMark m_trace;
+    void updateNoteItem();
+
     QString m_text = QStringLiteral("Надпись");
     QString m_label;
     QRectF  m_labelRect;
@@ -193,6 +242,9 @@ private:
     QVector<double> m_light;
     QString m_readout;
     QVector<quint8> m_cells;               // клетки карты Карно (kKarnaughStride × kKarnaughStride)
+    QString m_link;                        // имя связанной карты Карно
+    QStringList m_varNames;
+    void notifyKarnaugh();
     QString m_formula;                     // выбранная формула карты Карно
     quint64 m_problemMask = 0;
     bool m_problemBody = false;

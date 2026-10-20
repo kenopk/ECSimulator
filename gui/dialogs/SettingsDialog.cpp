@@ -128,6 +128,10 @@ SettingsDialog::SettingsDialog(QWidget *parent)
     nearMiss->setChecked(theme.showNearMiss());
     connect(nearMiss, &QCheckBox::toggled, this, [](bool on) { Theme::instance().setShowNearMiss(on); });
 
+    auto *lengthMarks = new QCheckBox(QStringLiteral("Дифф. пары на схеме: штрихи по номеру пары, красным — проводник короче напарника"), this);
+    lengthMarks->setChecked(theme.showLengthMarks());
+    connect(lengthMarks, &QCheckBox::toggled, this, [](bool on) { Theme::instance().setShowLengthMarks(on); });
+
     auto *form = new QFormLayout;
     form->setHorizontalSpacing(16);
     form->setVerticalSpacing(12);
@@ -137,6 +141,7 @@ SettingsDialog::SettingsDialog(QWidget *parent)
     form->addRow(QString(), labels);
     form->addRow(QString(), junctions);
     form->addRow(QString(), nearMiss);
+    form->addRow(QString(), lengthMarks);
 
     auto *close = new QPushButton(QStringLiteral("Закрыть"), this);
     close->setProperty("primary", true);

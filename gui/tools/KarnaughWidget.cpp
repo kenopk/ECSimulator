@@ -1,5 +1,7 @@
 #include "tools/KarnaughWidget.h"
 
+#include "tools/KarnaughLinks.h"
+
 #include <QApplication>
 #include <QClipboard>
 #include <QFont>
@@ -480,6 +482,7 @@ KarnaughWidget::KarnaughWidget(QWidget *parent)
     connect(m_debounce, &QTimer::timeout, this, &KarnaughWidget::recompute);
 
     connect(m_canvas, &KarnaughCanvas::changed, this, &KarnaughWidget::scheduleRecompute);
+    connect(m_canvas, &KarnaughCanvas::changed, this, &KarnaughWidget::emitState);
     connect(m_canvas, &KarnaughCanvas::geometryChanged, this, &KarnaughWidget::updateTableHeight);
     connect(m_widthEdit, &QLineEdit::textEdited, this, &KarnaughWidget::onSizeEdited);
     connect(m_heightEdit, &QLineEdit::textEdited, this, &KarnaughWidget::onSizeEdited);
@@ -494,6 +497,7 @@ KarnaughWidget::KarnaughWidget(QWidget *parent)
     m_canvas->setVarNames(effectiveNames());
     updateTableHeight();
     scheduleRecompute();
+    KarnaughLinks::instance().attachMap(this);               // правки карты видны на связанных элементах схем
 }
 
 KarnaughWidget::~KarnaughWidget()
@@ -513,8 +517,15 @@ KarnaughWidget::State KarnaughWidget::state() const
     return s;
 }
 
+void KarnaughWidget::emitState()
+{
+    if (!m_applying)
+        emit stateChanged();
+}
+
 void KarnaughWidget::setState(const State &state)
 {
+    m_applying = true;
     m_canvas->resizeMap(state.width, state.height);
     m_widthEdit->setText(QString::number(m_canvas->columns()));
     m_heightEdit->setText(QString::number(m_canvas->rows()));
@@ -529,6 +540,8 @@ void KarnaughWidget::setState(const State &state)
     }
     m_canvas->setVarNames(effectiveNames());
     scheduleRecompute();
+    m_applying = false;
+    emit stateChanged();
 }
 
 int KarnaughWidget::variableCount() const
@@ -571,6 +584,7 @@ void KarnaughWidget::onSizeEdited()
     m_canvas->resizeMap(w, h);
     syncDefaultNames();
     m_canvas->setVarNames(effectiveNames());
+    emitState();                         // имена по умолчанию зависят от размера
 }
 
 void KarnaughWidget::onNamesChanged()
@@ -579,6 +593,7 @@ void KarnaughWidget::onNamesChanged()
         return;
     m_canvas->setVarNames(effectiveNames());
     scheduleRecompute();
+    emitState();
 }
 
 void KarnaughWidget::updateTableHeight()

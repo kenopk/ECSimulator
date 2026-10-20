@@ -546,7 +546,10 @@ void paintKarnaugh(const Ctx &c, const ChipGeom &g, qreal cx)
 {
     QPainter *p = c.p;
     const KmapGeom k = kmapGeom(g.variant);
-    const QStringList names = Karnaugh::variableNames(k.rowBits + k.colBits);
+    QStringList names = c.names;
+    const QStringList defaults = Karnaugh::variableNames(k.rowBits + k.colBits);
+    for (int i = names.size(); i < k.rowBits + k.colBits; ++i)
+        names << defaults.value(i);
     QString rowNames, colNames;
     for (int i = 0; i < k.rowBits; ++i)
         rowNames += names.value(i);

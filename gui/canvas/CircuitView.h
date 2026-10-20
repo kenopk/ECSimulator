@@ -4,6 +4,7 @@
 #include <QGraphicsView>
 #include <QList>
 #include <QMap>
+#include <QPointer>
 #include <QPoint>
 #include <QSet>
 #include <QString>
@@ -11,11 +12,13 @@
 #include <QVector>
 #include <climits>
 
+#include "items/WireNote.h"
 #include "sim/SimIssue.h"
 #include "util/CoreTypes.h"
 
 class CircuitItem;
 class CircuitScene;
+class NoteItem;
 class ScopeItem;
 class IssueBanner;
 class QRubberBand;
@@ -29,6 +32,8 @@ struct ItemData {
     QMap<QString, double> params;
     QString text;                     // текст надписи
     QVector<quint8> cells;            // клетки карты Карно (пусто у остальных элементов)
+    WireNote note;                    // комментарий провода
+    QString link;                     // карта Карно, с которой связан элемент «Карта Карно»
 };
 
 // Редактор схемы: выбор, рисование проводов и элементов, перенос, поворот,
@@ -80,6 +85,10 @@ public:
     void setItemParam(CircuitItem *item, const QString &key, double value);
     void setItemParams(CircuitItem *item, const QMap<QString, double> &values);
     void setItemText(CircuitItem *item, const QString &text);
+    // Комментарий провода (с отменой). mergeable — правки калькуляторов склеиваются в один шаг.
+    void setItemNote(CircuitItem *item, const WireNote &note, const QString &undoText, bool mergeable = false);
+    void setItemLink(CircuitItem *item, const QString &mapName);   // связь элемента «Карта Карно» с картой (с отменой)
+    void setMmPerCell(double mm);                       // масштаб схемы как платы (мм на клетку), с отменой
 
     // --- слепки (дублирование схемы) --------------------------------------
     QVector<ItemData> snapshot(bool selectedOnly) const;
@@ -118,6 +127,7 @@ signals:
     void bannerShowRequested();                                     // «Показать» на плашке остановки
     void scopeActivated(ScopeItem *scope);                          // клик по шестерёнке / двойной клик: параметры
     void scopeMenuRequested(ScopeItem *scope, const QPoint &globalPos);   // ПКМ по осциллограмме
+    void noteEditRequested(CircuitItem *wire);                      // двойной клик по проводу или его блоку комментария
 
 protected:
     void wheelEvent(QWheelEvent *e) override;
@@ -186,6 +196,11 @@ private:
     ScopeItem *m_scopeDrag = nullptr;        // осциллограмма, которую сейчас тащат мышью
     QPointF m_scopeOffset;
     ScopeItem *scopeAt(const QPointF &scenePos) const;
+    QPointer<NoteItem> m_noteDrag;           // блок комментария, который сейчас тащат мышью
+    QPointF m_noteMouseOffset;
+    QPoint m_noteStartOffset;
+    NoteItem *noteAt(const QPointF &scenePos) const;
+    void refreshHoverTip();
     CircuitItem *m_heldKeypad = nullptr;    // клавиатура с удерживаемой клавишей
     CircuitItem *m_clickDip = nullptr;      // DIP-переключатель: щелчок без сдвига переключает позицию m_clickDipPart
     int m_clickDipPart = 0;

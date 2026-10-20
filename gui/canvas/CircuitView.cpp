@@ -1,5 +1,7 @@
 #include "canvas/CircuitView.h"
 
+#include "items/NoteItem.h"
+#include "tools/KarnaughLinks.h"
 #include "scope/ScopeItem.h"
 #include "sim/IssueBanner.h"
 
@@ -57,6 +59,7 @@ CircuitView::CircuitView(QWidget *parent)
     centerOn(0, 0);
 
     m_rubber = new QRubberBand(QRubberBand::Rectangle, viewport());
+    KarnaughLinks::instance().attachView(this);              // элементы «Карта Карно» связываются с картами проекта
 
     connect(m_scene, &QGraphicsScene::selectionChanged, this, &CircuitView::selectionChanged);
     connect(m_undo, &QUndoStack::indexChanged, this, [this] {
@@ -238,6 +241,42 @@ ScopeItem *CircuitView::scopeAt(const QPointF &scenePos) const
     return nullptr;
 }
 
+NoteItem *CircuitView::noteAt(const QPointF &scenePos) const
+{
+    for (QGraphicsItem *gi : m_scene->items(scenePos, Qt::IntersectsItemShape, Qt::DescendingOrder))
+        if (gi->type() == NoteItem::Type)
+            return static_cast<NoteItem *>(gi);
+    return nullptr;
+}
+
+void CircuitView::refreshHoverTip()
+{
+    viewport()->setToolTip(m_hoverItem ? m_hoverItem->hoverTip() : QString());
+}
+
+void CircuitView::setItemNote(CircuitItem *item, const WireNote &note, const QString &undoText, bool mergeable)
+{
+    if (!item || item->note() == note)
+        return;
+    m_undo->push(new ChangeNoteCommand(item, item->note(), note, undoText, mergeable));
+    refreshHoverTip();
+}
+
+void CircuitView::setItemLink(CircuitItem *item, const QString &mapName)
+{
+    if (!item || !item->isKarnaugh() || item->link() == mapName)
+        return;
+    m_undo->push(new ChangeLinkCommand(item, mapName));
+}
+
+void CircuitView::setMmPerCell(double mm)
+{
+    if (!(mm > 0.0) || qFuzzyCompare(mm, m_scene->mmPerCell()))
+        return;
+    m_undo->push(new ChangeScaleCommand(m_scene, m_scene->mmPerCell(), mm));
+    refreshHoverTip();
+}
+
 ScopeItem *CircuitView::addScope(CircuitItem *target)
 {
     if (!target)
@@ -282,9 +321,29 @@ void CircuitView::deleteSelected()
             delete gi;
         }
     }
+    // Выделенные блоки комментариев не удаляются вместе с текстом: блок только скрывается (текст остаётся у провода).
+    QList<CircuitItem *> hideNotes;
+    for (QGraphicsItem *gi : selected)
+        if (gi->type() == NoteItem::Type) {
+            CircuitItem *owner = static_cast<NoteItem *>(gi)->owner();
+            if (owner && !owner->isSelected() && !hideNotes.contains(owner))
+                hideNotes.append(owner);
+        }
     const QList<CircuitItem *> sel = selectedCircuitItems();
-    if (sel.isEmpty())
+    if (sel.isEmpty() && hideNotes.isEmpty())
         return;
+    if (!hideNotes.isEmpty()) {
+        m_undo->beginMacro(QStringLiteral("Удаление"));
+        for (CircuitItem *w : std::as_const(hideNotes)) {
+            WireNote n = w->note();
+            n.shown = false;
+            m_undo->push(new ChangeNoteCommand(w, w->note(), n, QStringLiteral("Скрыть блок комментария")));
+        }
+        if (!sel.isEmpty())
+            m_undo->push(new RemoveItemsCommand(m_scene, sel, QStringLiteral("Удаление")));
+        m_undo->endMacro();
+        return;
+    }
     m_undo->push(new RemoveItemsCommand(m_scene, sel, QStringLiteral("Удаление")));
 }
 
@@ -322,6 +381,10 @@ QVector<ItemData> CircuitView::snapshot(bool selectedOnly) const
         d.text = it->text();
         if (it->isKarnaugh())
             d.cells = it->cells();
+        if (it->isWire())
+            d.note = it->note();
+        if (it->isKarnaugh())
+            d.link = it->link();
         out.append(d);
     }
     return out;
@@ -339,6 +402,10 @@ QList<CircuitItem *> CircuitView::addItems(const QVector<ItemData> &data, const 
         if (!d.cells.isEmpty())
             it->setCells(d.cells);
         it->setGeometry(d.a + offset, d.b + offset, d.flip);
+        if (it->isWire() && d.note != WireNote())
+            it->setNote(d.note);
+        if (it->isKarnaugh())
+            it->setLink(d.link);
         created.append(it);
     }
     if (created.isEmpty())
@@ -705,6 +772,7 @@ void CircuitView::updateHover(const QPointF &sp)
     m_hoverEndpoint = ep;
     if (it)
         it->setHover(ep < 0, ep);
+    refreshHoverTip();
     updateCursor();
 }
 
@@ -714,6 +782,7 @@ void CircuitView::dropHover()
         m_hoverItem->setHover(false, -1);
     m_hoverItem = nullptr;
     m_hoverEndpoint = -1;
+    refreshHoverTip();
     updateCursor();
 }
 
@@ -1095,6 +1164,25 @@ void CircuitView::mousePressEvent(QMouseEvent *e)
         return;
     }
 
+    // Блок комментария провода: «×» скрывает его, иначе — выделить и тащить.
+    if (NoteItem *note = noteAt(sp)) {
+        CircuitItem *owner = note->owner();
+        if (note->closeHit(note->mapFromScene(sp))) {
+            WireNote n = owner->note();
+            n.shown = false;
+            setItemNote(owner, n, QStringLiteral("Скрыть блок комментария"));
+        } else {
+            if (!ctrl)
+                m_scene->clearSelection();
+            note->setSelected(true);
+            m_noteDrag = note;
+            m_noteMouseOffset = note->pos() - sp;
+            m_noteStartOffset = owner->note().offset;
+        }
+        e->accept();
+        return;
+    }
+
     int ep = -1;
     CircuitItem *it = hitItem(sp, &ep);
 
@@ -1145,6 +1233,11 @@ void CircuitView::mouseMoveEvent(QMouseEvent *e)
 
     if (m_scopeDrag && (e->buttons() & Qt::LeftButton)) {
         m_scopeDrag->setPos(CircuitScene::snap(sp + m_scopeOffset));
+        e->accept();
+        return;
+    }
+    if (m_noteDrag && (e->buttons() & Qt::LeftButton)) {
+        m_noteDrag->moveTo(QPointF(CircuitScene::snap(sp + m_noteMouseOffset)));
         e->accept();
         return;
     }
@@ -1204,6 +1297,19 @@ void CircuitView::mouseReleaseEvent(QMouseEvent *e)
         e->accept();
         return;
     }
+    if (m_noteDrag) {
+        NoteItem *note = m_noteDrag;
+        m_noteDrag = nullptr;
+        CircuitItem *owner = note->owner();
+        const QPoint offset = (note->pos() - owner->midpoint()).toPoint();
+        if (offset != m_noteStartOffset) {
+            WireNote n = owner->note();
+            n.offset = offset;
+            setItemNote(owner, n, QStringLiteral("Перенос блока комментария"));
+        }
+        e->accept();
+        return;
+    }
 
     CircuitItem *toggle = m_clickToggle;
     m_clickToggle = nullptr;
@@ -1244,8 +1350,25 @@ void CircuitView::mouseDoubleClickEvent(QMouseEvent *e)
         }
     }
     if (e->button() == Qt::LeftButton && m_selectMode) {
+        if (NoteItem *note = noteAt(mapToScene(e->position().toPoint()))) {
+            m_noteDrag = nullptr;
+            emit noteEditRequested(note->owner());
+            e->accept();
+            return;
+        }
+    }
+    if (e->button() == Qt::LeftButton && m_selectMode) {
         if (CircuitItem *it = hitItem(mapToScene(e->position().toPoint()), nullptr)) {
             cancelOperation();           // первый клик двойного клика мог начать перенос
+            if (it->isWire()) {          // у провода окна параметров нет, но есть комментарий
+                if (!it->isSelected()) {
+                    m_scene->clearSelection();
+                    it->setSelected(true);
+                }
+                emit noteEditRequested(it);
+                e->accept();
+                return;
+            }
             if (!it->hasProperties()) {
                 // У выключателей и кнопок окна свойств нет: двойной клик — это два переключения подряд.
                 if (it->isToggle())
@@ -1294,7 +1417,8 @@ void CircuitView::contextMenuEvent(QContextMenuEvent *e)
         }
     }
     if (m_selectMode && m_drag == Drag::None) {
-        CircuitItem *it = hitItem(mapToScene(e->pos()), nullptr);
+        NoteItem *note = noteAt(mapToScene(e->pos()));
+        CircuitItem *it = note ? note->owner() : hitItem(mapToScene(e->pos()), nullptr);
         m_contextItem = it;
         if (it && !it->isSelected()) {
             m_scene->clearSelection();

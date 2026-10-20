@@ -15,6 +15,7 @@
 class CircuitItem;
 class CircuitView;
 class KarnaughSection;
+class PcbToolkitSection;
 class ProjectPanel;
 struct ProjectDoc;
 class IssueLog;
@@ -96,7 +97,13 @@ public:
     bool openProjectFile(const QString &path);
     bool saveProject(int projectId, bool saveAs);          // 0 — активный проект
     void closeProject(int projectId, bool askToSave = true);   // 0 — активный проект
-    void showSection(int section, bool autoCreate = true);   // autoCreate: пустой раздел карт сам создаёт первую карту
+    // Связь схемы с расчётами: провод становится объектом калькуляторов «Печатных плат» (длина, ширина),
+    // а результат расчёта попадает в комментарий провода.
+    void openPcbForWire(CircuitItem *wire, int pageId);
+    // Дифференциальная пара: помечает проводник (всю цепочку проводов) у каждого из wires номером пары number
+    // (0 — убрать из пары). Проводники с одним номером — одна пара; одно действие отмены.
+    void assignDiffPair(const QList<CircuitItem *> &wires, int number);
+    void showSection(int section, bool autoCreate = true);   // 0 — схемы, 1 — карты Карно, 2 — печатные платы; autoCreate: пустой раздел карт сам создаёт первую карту
     void onSimulationToggled(bool on);
     void recheckIssues();                         // схема изменилась: перепроверить правила
     void clearIssues();
@@ -191,6 +198,11 @@ private:
     void showAbout();
     void showControls();
     void showNotYet();
+    void openWireNoteDialog(CircuitItem *wire);        // комментарий провода и его ширина на плате
+    void createPcbSection();
+    void refreshPcbTrace();                             // трасса связанного провода изменилась — обновить калькуляторы
+    void onPcbTraceComment(const QString &text, bool automatic);
+    void chooseScale();                                 // «мм на клетку» у текущей схемы
     QString placeHint(ElementType type) const;
 
     EditorTabs *m_tabs = nullptr;
@@ -216,12 +228,18 @@ private:
     QMenu *m_elementsMenu = nullptr;
     QStackedWidget *m_stack = nullptr;       // разделы: вкладки схем / вкладки карт Карно
     KarnaughSection *m_karnaugh = nullptr;
+    PcbToolkitSection *m_pcb = nullptr;      // раздел «Печатные платы»: создаётся при первом входе
     ProjectPanel *m_projectPanel = nullptr;  // только в основном окне
     QDockWidget *m_projectDock = nullptr;
     QDockWidget *m_navDock = nullptr;
     QActionGroup *m_navGroup = nullptr;      // переключатель разделов на левой панели
     QAction *m_navSimAction = nullptr;
     QAction *m_navKarnaughAction = nullptr;
+    QAction *m_navPcbAction = nullptr;
+    QAction *m_scaleAction = nullptr;
+    QPointer<CircuitView> m_traceView;       // схема и провод, с которым связаны калькуляторы
+    quint64 m_traceUid = 0;
+    QVector<QMetaObject::Connection> m_traceConns;
 
     QActionGroup *m_toolGroup = nullptr;
     QAction *m_selectAction = nullptr;

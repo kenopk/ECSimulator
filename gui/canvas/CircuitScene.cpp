@@ -1,11 +1,14 @@
 #include "canvas/CircuitScene.h"
 
+#include <QMap>
 #include <QPainter>
+#include <QSet>
 #include <QTimer>
 #include <QVector>
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 #include "items/CircuitItem.h"
 #include "theme/Theme.h"
@@ -86,6 +89,7 @@ void CircuitScene::ensureConnectivity() const
     if (!m_connectivityDirty)
         return;
     rebuild();
+    rebuildTraces();
     m_connectivityDirty = false;
 }
 
@@ -229,6 +233,151 @@ void CircuitScene::rebuild() const
 
     for (CircuitItem *ci : all)
         ci->setNearMiss(masks.value(ci, quint64(0)));
+}
+
+void CircuitScene::rebuildTraces() const
+{
+    m_traces.clear();
+
+    QVector<CircuitItem *> wires;
+    QHash<qint64, QVector<int>> wireAt;                    // провода по точкам их концов
+    for (CircuitItem *ci : circuitItems()) {
+        if (!ci->isWire() || ci->isPreview() || ci->length() < 1.0)
+            continue;
+        const int idx = wires.size();
+        wires.append(ci);
+        wireAt[key(ci->p1())].append(idx);
+        wireAt[key(ci->p2())].append(idx);
+    }
+
+    QVector<int> parent(wires.size());
+    for (int i = 0; i < parent.size(); ++i)
+        parent[i] = i;
+    const auto find = [&](int x) {
+        while (parent[x] != x) {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        return x;
+    };
+    for (auto it = wireAt.constBegin(); it != wireAt.constEnd(); ++it) {
+        if (it.value().size() != 2)
+            continue;
+        const auto node = m_nodes.constFind(it.key());
+        if (node == m_nodes.constEnd() || node.value().count != 2)
+            continue;                                     // в точке есть вывод элемента или ответвление — трасса кончается
+        const int ra = find(it.value()[0]), rb = find(it.value()[1]);
+        if (ra != rb)
+            parent[ra] = rb;
+    }
+
+    QHash<int, int> traceOfRoot;
+    for (int i = 0; i < wires.size(); ++i) {
+        const int root = find(i);
+        auto found = traceOfRoot.constFind(root);
+        if (found == traceOfRoot.constEnd()) {
+            found = traceOfRoot.insert(root, m_traces.size());
+            m_traces.append(Trace());
+        }
+        Trace &t = m_traces[found.value()];
+        t.wires.append(wires[i]);
+        t.lengthPx += wires[i]->length();
+    }
+
+    // Номер пары у трассы — наименьший ненулевой «diffPair» среди её проводов: достроили провод к уже помеченной
+    // трассе — он сразу в той же паре.
+    for (Trace &t : m_traces) {
+        for (CircuitItem *w : std::as_const(t.wires)) {
+            const int n = w->diffPair();
+            if (n > 0 && (t.pair == 0 || n < t.pair))
+                t.pair = n;
+        }
+    }
+    QHash<int, QVector<int>> pairMembers;                   // номер пары -> индексы трасс
+    for (int i = 0; i < m_traces.size(); ++i)
+        if (m_traces[i].pair > 0)
+            pairMembers[m_traces[i].pair].append(i);
+    for (auto it = pairMembers.constBegin(); it != pairMembers.constEnd(); ++it) {
+        double longest = 0, shortest = std::numeric_limits<double>::max();
+        for (int idx : it.value()) {
+            longest = std::max(longest, m_traces[idx].lengthPx);
+            shortest = std::min(shortest, m_traces[idx].lengthPx);
+        }
+        for (int idx : it.value()) {
+            Trace &t = m_traces[idx];
+            t.pairSize = int(it.value().size());
+            t.longestPx = longest;
+            t.shortestPx = shortest;
+            t.lagging = t.pairSize >= 2 && longest - t.lengthPx > kLengthTolerancePx;
+        }
+    }
+
+    for (Trace &t : m_traces) {
+        CircuitItem *longest = t.wires.first();
+        for (CircuitItem *w : std::as_const(t.wires))
+            if (w->length() > longest->length())
+                longest = w;
+        for (CircuitItem *w : std::as_const(t.wires)) {
+            TraceMark m;
+            m.lengthPx = t.lengthPx;
+            m.pair = t.pair;
+            m.pairSize = t.pairSize;
+            m.longestPx = t.longestPx;
+            m.shortestPx = t.shortestPx;
+            m.lagging = t.lagging;
+            m.carrier = w == longest;
+            w->setTraceMark(m);
+        }
+    }
+}
+
+QVector<CircuitScene::PairInfo> CircuitScene::diffPairs() const
+{
+    ensureConnectivity();
+    QMap<int, PairInfo> byNumber;
+    for (const Trace &t : std::as_const(m_traces)) {
+        if (t.pair <= 0)
+            continue;
+        PairInfo &p = byNumber[t.pair];
+        p.number = t.pair;
+        p.traces = t.pairSize;
+        p.longestPx = t.longestPx;
+        p.shortestPx = t.shortestPx;
+    }
+    return byNumber.values().toVector();
+}
+
+int CircuitScene::nextFreePair() const
+{
+    ensureConnectivity();
+    QSet<int> used;
+    for (const Trace &t : std::as_const(m_traces))
+        if (t.pair > 0)
+            used.insert(t.pair);
+    int n = 1;
+    while (used.contains(n))
+        ++n;
+    return n;
+}
+
+CircuitScene::Trace CircuitScene::traceOf(const CircuitItem *wire) const
+{
+    ensureConnectivity();
+    for (const Trace &t : std::as_const(m_traces))
+        if (t.wires.contains(const_cast<CircuitItem *>(wire)))
+            return t;
+    return Trace();
+}
+
+void CircuitScene::setMmPerCell(double mm)
+{
+    if (!(mm > 0.0) || qFuzzyCompare(mm, m_mmPerCell))
+        return;
+    m_mmPerCell = mm;
+    for (CircuitItem *ci : circuitItems())
+        if (ci->isWire() && ci->noteItem())
+            ci->noteItem()->refresh();                  // в подписи блока длина в миллиметрах
+    emit scaleChanged();
 }
 
 int CircuitScene::connectionCount(const QPoint &p) const

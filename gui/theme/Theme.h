@@ -67,6 +67,10 @@ public:
     bool showNearMiss() const { return m_showNearMiss; }
     void setShowNearMiss(bool on);
 
+    // Метки дифф. пар: штрихи поперёк трассы по номеру пары (1, 2, 3…) и красный цвет проводника, который короче напарника.
+    bool showLengthMarks() const { return m_showLengthMarks; }
+    void setShowLengthMarks(bool on);
+
     // Масштаб напряжения для раскраски проводов (будет задавать ядро).
     double voltageScale() const { return m_voltageScale; }
     void setVoltageScale(double volts) { m_voltageScale = volts > 0 ? volts : 1.0; }
@@ -98,5 +102,6 @@ private:
     bool      m_showLabels = true;
     bool      m_showJunctions = true;
     bool      m_showNearMiss = true;
+    bool      m_showLengthMarks = true;
     double    m_voltageScale = 5.0;
 };

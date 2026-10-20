@@ -84,6 +84,12 @@ public:
     };
     State state() const;
     void setState(const State &state);
+    QStringList names() const { return effectiveNames(); }     // имена переменных (недостающие — A, B, …)
+
+signals:
+    // Пользователь изменил карту (клетки, размер, имена) либо состояние выставили целиком; по нему связанные
+    // элементы схемы обновляют свои данные (tools/KarnaughLinks).
+    void stateChanged();
 
 private:
     QStringList effectiveNames() const;          // имена из поля, недостающие дополняются A, B, …
@@ -110,6 +116,8 @@ private:
 
     bool m_namesEdited = false;                  // пользователь правил имена вручную
     bool m_syncingNames = false;
+    bool m_applying = false;                     // идёт setState: промежуточные состояния наружу не отдаём
+    void emitState();
     std::shared_ptr<std::atomic<bool>> m_cancel;
     int m_generation = 0;
 };

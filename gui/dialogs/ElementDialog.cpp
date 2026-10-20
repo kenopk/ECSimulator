@@ -1,5 +1,6 @@
 #include "dialogs/ElementDialog.h"
 
+#include <QComboBox>
 #include <QFormLayout>
 #include <QFrame>
 #include <QHBoxLayout>
@@ -17,7 +18,7 @@
 #include "theme/Theme.h"
 #include "widgets/ParamForm.h"
 
-ElementDialog::ElementDialog(CircuitItem *item, QWidget *parent)
+ElementDialog::ElementDialog(CircuitItem *item, QWidget *parent, const QStringList &mapNames)
     : QDialog(parent)
 {
     const ElementInfo &info = elementInfo(item->elementType());
@@ -88,6 +89,33 @@ ElementDialog::ElementDialog(CircuitItem *item, QWidget *parent)
         root->addWidget(tip);
     }
 
+    // --- связь с картой Карно -----------------------------------------------
+    if (item->isKarnaugh()) {
+        auto *section = new QLabel(QStringLiteral("СВЯЗЬ С КАРТОЙ КАРНО"), this);
+        section->setObjectName(QStringLiteral("sectionTitle"));
+        root->addWidget(section);
+        m_linkBox = new QComboBox(this);
+        m_linkBox->addItem(QStringLiteral("Нет (самостоятельная карта)"), QString());
+        for (const QString &name : mapNames)
+            m_linkBox->addItem(name, name);
+        int current = 0;
+        for (int i = 1; i < m_linkBox->count(); ++i)
+            if (m_linkBox->itemData(i).toString() == item->link())
+                current = i;
+        if (current == 0 && !item->link().isEmpty()) {         // карту переименовали или закрыли — связь остаётся по имени
+            m_linkBox->addItem(QStringLiteral("«%1» (такой карты сейчас нет)").arg(item->link()), item->link());
+            current = m_linkBox->count() - 1;
+        }
+        m_linkBox->setCurrentIndex(current);
+        root->addWidget(m_linkBox);
+        auto *tip = new QLabel(QStringLiteral(
+            "Клетки, размер и имена переменных берутся из карты раздела «Карты Карно», а правки клеток и размера на схеме "
+            "уходят в карту. Размер до 16×16; у большей карты на схеме виден фрагмент."), this);
+        tip->setObjectName(QStringLiteral("hint"));
+        tip->setWordWrap(true);
+        root->addWidget(tip);
+    }
+
     // --- кнопки ----------------------------------------------------------
     auto *buttons = new QHBoxLayout;
     buttons->setSpacing(8);
@@ -120,6 +148,11 @@ void ElementDialog::accept()
     if (m_form)
         m_form->commitPending();
     QDialog::accept();
+}
+
+QString ElementDialog::link() const
+{
+    return m_linkBox ? m_linkBox->currentData().toString() : QString();
 }
 
 QMap<QString, double> ElementDialog::values() const

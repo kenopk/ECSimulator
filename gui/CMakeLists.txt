@@ -1,4 +1,4 @@
-find_package(Qt6 REQUIRED COMPONENTS Widgets)
+find_package(Qt6 REQUIRED COMPONENTS Widgets PrintSupport)
 
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
@@ -16,9 +16,25 @@ set(GUI_SOURCES
 
     dialogs/ElementDialog.h  dialogs/ElementDialog.cpp
     dialogs/SettingsDialog.h dialogs/SettingsDialog.cpp
+    dialogs/WireNoteDialog.h dialogs/WireNoteDialog.cpp
 
     items/CircuitItem.h     items/CircuitItem.cpp
+    items/NoteItem.h        items/NoteItem.cpp
+    items/WireNote.h
     items/SymbolPainter.h   items/SymbolPainter.cpp   items/SymbolPainterExtra.inc
+
+    pcb/PcbCore.h
+    pcb/PcbContext.h
+    pcb/PcbWidgets.h        pcb/PcbWidgets.cpp
+    pcb/PcbPage.h           pcb/PcbPage.cpp
+    pcb/PcbPagesInternal.h  pcb/PcbPages.cpp
+    pcb/PcbPagesLines.cpp   pcb/PcbPagesCurrent.cpp
+    pcb/PcbPagesBoard.cpp   pcb/PcbPagesCircuits.cpp
+    pcb/PcbDialogs.h        pcb/PcbDialogs.cpp
+    pcb/PcbHelp.h           pcb/PcbHelp.cpp
+    pcb/PcbTrace.h
+    pcb/PcbOptions.h        pcb/PcbOptions.cpp
+    pcb/PcbToolkitSection.h pcb/PcbToolkitSection.cpp
 
     project/ProjectFile.h   project/ProjectFile.cpp
     project/ProjectPanel.h  project/ProjectPanel.cpp
@@ -40,6 +56,7 @@ set(GUI_SOURCES
     util/CoreTypes.h
     util/Units.h            util/Units.cpp
 
+    tools/KarnaughLinks.h   tools/KarnaughLinks.cpp
     tools/KarnaughSection.h tools/KarnaughSection.cpp
     tools/KarnaughSolver.h  tools/KarnaughSolver.cpp
     tools/KarnaughWidget.h  tools/KarnaughWidget.cpp
@@ -65,6 +82,7 @@ target_include_directories(GOVNO PRIVATE
 
 target_link_libraries(GOVNO PRIVATE
     Qt6::Widgets
+    Qt6::PrintSupport
     govno::core
 )
 

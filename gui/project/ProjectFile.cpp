@@ -76,6 +76,19 @@ QJsonObject itemToJson(const ItemData &d)
         o.insert(QStringLiteral("text"), d.text);
     if (!d.cells.isEmpty())
         o.insert(QStringLiteral("cells"), cellsToJson(d.cells));
+    if (!d.link.isEmpty())
+        o.insert(QStringLiteral("link"), d.link);
+    if (d.type == ElementType::Wire && d.note != WireNote()) {
+        QJsonObject n;
+        n.insert(QStringLiteral("text"), d.note.text);
+        if (d.note.shown)
+            n.insert(QStringLiteral("shown"), true);
+        n.insert(QStringLiteral("dx"), d.note.offset.x());
+        n.insert(QStringLiteral("dy"), d.note.offset.y());
+        if (d.note.autoText)
+            n.insert(QStringLiteral("auto"), true);
+        o.insert(QStringLiteral("note"), n);
+    }
     return o;
 }
 
@@ -92,6 +105,8 @@ bool save(const QString &path, const ProjectDoc &doc, QString *error)
             items.append(itemToJson(d));
         QJsonObject o;
         o.insert(QStringLiteral("name"), s.name);
+        if (s.mmPerCell != 1.0)
+            o.insert(QStringLiteral("mmPerCell"), s.mmPerCell);
         o.insert(QStringLiteral("items"), items);
         schemes.append(o);
     }
@@ -163,6 +178,7 @@ bool load(const QString &path, ProjectDoc *doc, QString *error, int *skipped)
         const QJsonObject so = sv.toObject();
         SchemeDoc s;
         s.name = so.value(QStringLiteral("name")).toString();
+        s.mmPerCell = std::max(1e-6, so.value(QStringLiteral("mmPerCell")).toDouble(1.0));
         for (const QJsonValue &iv : so.value(QStringLiteral("items")).toArray()) {
             const QJsonObject io = iv.toObject();
             const auto type = typeById().constFind(io.value(QStringLiteral("type")).toString());
@@ -181,6 +197,14 @@ bool load(const QString &path, ProjectDoc *doc, QString *error, int *skipped)
                 d.params.insert(it.key(), it.value().toDouble());
             d.text = io.value(QStringLiteral("text")).toString();
             d.cells = cellsFromJson(io.value(QStringLiteral("cells")));
+            d.link = io.value(QStringLiteral("link")).toString();
+            if (io.contains(QStringLiteral("note"))) {
+                const QJsonObject n = io.value(QStringLiteral("note")).toObject();
+                d.note.text = n.value(QStringLiteral("text")).toString();
+                d.note.shown = n.value(QStringLiteral("shown")).toBool();
+                d.note.offset = QPoint(n.value(QStringLiteral("dx")).toInt(32), n.value(QStringLiteral("dy")).toInt(-64));
+                d.note.autoText = n.value(QStringLiteral("auto")).toBool();
+            }
             s.items.append(d);
         }
         out.schemes.append(s);
@@ -333,7 +357,15 @@ void ProjectHub::attach(QWidget *page, int projectId, PageKind kind, const QStri
 int ProjectHub::projectOf(const QWidget *page) { return page ? page->property("govnoProject").toInt() : 0; }
 ProjectHub::PageKind ProjectHub::kindOf(const QWidget *page) { return page && page->property("govnoKind").toInt() == Map ? Map : Scheme; }
 QString ProjectHub::nameOf(const QWidget *page) { return page ? page->property("govnoName").toString() : QString(); }
-void ProjectHub::setNameOf(QWidget *page, const QString &name) { if (page) page->setProperty("govnoName", name); }
+void ProjectHub::setNameOf(QWidget *page, const QString &name)
+{
+    if (!page)
+        return;
+    const QString old = page->property("govnoName").toString();
+    page->setProperty("govnoName", name);
+    if (old != name && kindOf(page) == Map)
+        emit instance().pageRenamed(page, old, name);
+}
 
 QVector<QWidget *> ProjectHub::livePages() const
 {

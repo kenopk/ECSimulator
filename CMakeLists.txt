@@ -12,5 +12,11 @@ endif()
 # Две независимые части проекта:
 #   core — ядро симулятора (без GUI)
 #   gui  — визуальная оболочка (Qt Widgets), использует только публичный API ядра
+# Тесты ядра (без Qt) включаются ключом -DGOVNO_BUILD_TESTS=ON; запуск — ctest.
+option(GOVNO_BUILD_TESTS "Собрать тесты ядра" OFF)
+if(GOVNO_BUILD_TESTS)
+    enable_testing()
+endif()
+
 add_subdirectory(core)
 add_subdirectory(gui)

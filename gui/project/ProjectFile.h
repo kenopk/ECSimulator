@@ -16,6 +16,7 @@
 struct SchemeDoc {
     QString name;
     QVector<ItemData> items;
+    double mmPerCell = 1.0;      // масштаб схемы как платы: миллиметров в одной клетке сетки
 };
 
 struct MapDoc {
@@ -93,6 +94,8 @@ public:
 
 signals:
     void changed();
+    // Страницу-карту переименовали: связанные с ней элементы схем переходят на новое имя (tools/KarnaughLinks).
+    void pageRenamed(QWidget *page, const QString &oldName, const QString &newName);
 
 private:
     ProjectHub() = default;
